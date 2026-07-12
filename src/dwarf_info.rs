@@ -25,13 +25,16 @@ pub struct MemberInfo {
     pub ty: TypeInfo,
 }
 
-/// 変数/メンバの型情報。`->` によるメンバアクセスの連鎖を辿れるように、
-/// ポインタは指し示す先の型を、構造体はメンバ一覧を保持する。
+/// 変数/メンバの型情報。`->` によるメンバアクセスの連鎖や `[i]` による
+/// 添字アクセスを辿れるように、ポインタは指し示す先の型を、構造体は
+/// メンバ一覧を、配列は要素の型と要素数を保持する。
 #[derive(Debug, Clone)]
 pub enum TypeInfo {
     Base { byte_size: u64, encoding: u8, name: String },
     Pointer { pointee: Box<TypeInfo> },
-    Struct { name: Option<String>, is_union: bool, members: Vec<MemberInfo> },
+    Struct { name: Option<String>, is_union: bool, byte_size: u64, members: Vec<MemberInfo> },
+    /// `count` は要素数(不明な場合は `None`。フレキシブル配列メンバ等)。
+    Array { element: Box<TypeInfo>, count: Option<u64> },
     /// 解決できなかった型(未対応の DIE 形式等)。符号なし8バイトとして扱う。
     Unknown,
 }
@@ -42,8 +45,20 @@ impl TypeInfo {
         matches!(self, TypeInfo::Pointer { .. })
     }
 
+    /// この型の値1つ分のバイトサイズ。配列の要素アドレス計算(添字の
+    /// ストライド)に使う。
+    pub fn byte_size(&self) -> u64 {
+        match self {
+            TypeInfo::Base { byte_size, .. } => *byte_size,
+            TypeInfo::Pointer { .. } => 8,
+            TypeInfo::Struct { byte_size, .. } => *byte_size,
+            TypeInfo::Array { element, count } => element.byte_size() * count.unwrap_or(0),
+            TypeInfo::Unknown => 8,
+        }
+    }
+
     /// `set print pretty on` での型情報表示に使う、人間向けの型名
-    /// (`int`, `struct Point`, `struct Point *` 等)。
+    /// (`int`, `struct Point`, `struct Point *`, `int[3]` 等)。
     pub fn type_name(&self) -> String {
         match self {
             TypeInfo::Base { name, .. } => name.clone(),
@@ -62,6 +77,10 @@ impl TypeInfo {
                     None => keyword.to_string(),
                 }
             }
+            TypeInfo::Array { element, count } => match count {
+                Some(n) => format!("{}[{}]", element.type_name(), n),
+                None => format!("{}[]", element.type_name()),
+            },
             TypeInfo::Unknown => "?".to_string(),
         }
     }
@@ -450,8 +469,28 @@ fn resolve_full_type<'a>(
             gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type => {
                 let name = die_name(dwarf, unit, &entry);
                 let is_union = entry.tag() == gimli::DW_TAG_union_type;
+                let byte_size =
+                    entry.attr_value(gimli::DW_AT_byte_size).and_then(|v| v.udata_value()).unwrap_or(0);
                 let members = collect_members(dwarf, unit, offset, depth + 1);
-                return TypeInfo::Struct { name, is_union, members };
+                return TypeInfo::Struct { name, is_union, byte_size, members };
+            }
+            gimli::DW_TAG_array_type => {
+                let element = match entry.attr_value(gimli::DW_AT_type) {
+                    Some(gimli::AttributeValue::UnitRef(next)) => {
+                        resolve_full_type(dwarf, unit, next, depth + 1)
+                    }
+                    _ => TypeInfo::Unknown,
+                };
+                // 多次元配列は `DW_TAG_array_type` 1つに複数の
+                // `DW_TAG_subrange_type` (次元ごと) がぶら下がる形で
+                // 表現される。外側の次元から順に「配列の配列」として
+                // ネストした `TypeInfo::Array` を組み立てる。
+                let dims = array_dims(unit, offset);
+                let mut ty = element;
+                for count in dims.into_iter().rev() {
+                    ty = TypeInfo::Array { element: Box::new(ty), count };
+                }
+                return ty;
             }
             gimli::DW_TAG_typedef
             | gimli::DW_TAG_const_type
@@ -467,6 +506,32 @@ fn resolve_full_type<'a>(
         }
     }
     TypeInfo::Unknown
+}
+
+/// `array_offset` にある `DW_TAG_array_type` DIE の直下の
+/// `DW_TAG_subrange_type` (次元ごとの要素数) を、外側の次元から順に集める。
+/// 要素数は `DW_AT_count` を優先し、無ければ `DW_AT_upper_bound + 1` を使う。
+/// どちらも無い場合 (不完全配列型等) は `None` とする。
+fn array_dims<'a>(unit: &gimli::Unit<Reader<'a>>, array_offset: gimli::UnitOffset) -> Vec<Option<u64>> {
+    let mut dims = Vec::new();
+    let Ok(mut tree) = unit.entries_tree(Some(array_offset)) else {
+        return dims;
+    };
+    let Ok(root) = tree.root() else {
+        return dims;
+    };
+    let mut children = root.children();
+    while let Ok(Some(child)) = children.next() {
+        let entry = child.entry();
+        if entry.tag() != gimli::DW_TAG_subrange_type {
+            continue;
+        }
+        let count = entry.attr_value(gimli::DW_AT_count).and_then(|v| v.udata_value()).or_else(|| {
+            entry.attr_value(gimli::DW_AT_upper_bound).and_then(|v| v.udata_value()).map(|u| u + 1)
+        });
+        dims.push(count);
+    }
+    dims
 }
 
 /// `struct_offset` にある構造体/共用体 DIE の直下のメンバ (`DW_TAG_member`)

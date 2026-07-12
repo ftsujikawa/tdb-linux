@@ -819,8 +819,8 @@ impl Debugger {
     /// (`set print pretty`/`set print elements` の対象)。
     pub fn read_for_print(&self, name: &str) -> Result<expr::PrintResult> {
         let (addr, var) = self.resolve_variable(name)?;
-        if matches!(var.ty, dwarf_info::TypeInfo::Struct { .. }) {
-            return Ok(expr::PrintResult::Struct(self.format_struct_value(addr, &var.ty, 0)));
+        if matches!(var.ty, dwarf_info::TypeInfo::Struct { .. } | dwarf_info::TypeInfo::Array { .. }) {
+            return Ok(expr::PrintResult::Text(self.format_value_by_type(addr, &var.ty, 0)));
         }
         let value = self.read_typed_value(addr, &var.ty)?;
         let hint = expr::TypeHint { is_pointer: var.is_pointer, type_name: var.ty.type_name() };
@@ -904,8 +904,8 @@ impl Debugger {
     /// 文字列を組み立てる(`print` と同じ表示ルール: `pretty on` なら
     /// 型情報付き)。
     fn format_var_value(&self, var: &dwarf_info::VarInfo, addr: u64) -> Result<String> {
-        if matches!(var.ty, dwarf_info::TypeInfo::Struct { .. }) {
-            return Ok(self.format_struct_value(addr, &var.ty, 0));
+        if matches!(var.ty, dwarf_info::TypeInfo::Struct { .. } | dwarf_info::TypeInfo::Array { .. }) {
+            return Ok(self.format_value_by_type(addr, &var.ty, 0));
         }
         let value = self.read_typed_value(addr, &var.ty)?;
         Ok(match value {
@@ -920,11 +920,52 @@ impl Debugger {
         })
     }
 
+    /// `addr` にある値を `ty` に従って表示用文字列に変換する。構造体・配列は
+    /// それぞれ専用の整形関数に委譲し(それらが `pretty on` 時の型名付与も
+    /// 含めて自己完結して処理する)、スカラー/ポインタはここで
+    /// `(型名)値` 形式(`pretty on` の場合のみ)に整形する。
+    /// `format_struct_value`/`format_array_value` の要素・メンバの表示に
+    /// 共通で使う。
+    fn format_value_by_type(&self, addr: u64, ty: &dwarf_info::TypeInfo, depth: usize) -> String {
+        match ty {
+            dwarf_info::TypeInfo::Struct { .. } => self.format_struct_value(addr, ty, depth),
+            dwarf_info::TypeInfo::Array { .. } => self.format_array_value(addr, ty, depth),
+            dwarf_info::TypeInfo::Pointer { .. } => match self.read_typed_value(addr, ty) {
+                Ok(v) => {
+                    let s = format!("{:#x}", v.as_i64() as u64);
+                    if self.print_pretty {
+                        format!("({}){}", ty.type_name(), s)
+                    } else {
+                        s
+                    }
+                }
+                Err(_) => "?".to_string(),
+            },
+            _ => match self.read_typed_value(addr, ty) {
+                Ok(expr::Value::Float(f)) => {
+                    if self.print_pretty {
+                        format!("({}){}", ty.type_name(), f)
+                    } else {
+                        f.to_string()
+                    }
+                }
+                Ok(expr::Value::Int(v)) => {
+                    if self.print_pretty {
+                        format!("({}){}", ty.type_name(), v)
+                    } else {
+                        v.to_string()
+                    }
+                }
+                Err(_) => "?".to_string(),
+            },
+        }
+    }
+
     /// 構造体の値を `{a = 1, b = 2}` の形式(`set print pretty on` なら
     /// 複数行インデント表示)でフォーマットする。ポインタ型メンバは指す先を
     /// 辿らずアドレスの16進表示のみ行う(GDB の既定動作と同様)。ネストした
-    /// 構造体は再帰的にフォーマットする(型解決自体が `MAX_TYPE_DEPTH` で
-    /// 打ち切られているため、無限再帰にはならない)。
+    /// 構造体・配列は再帰的にフォーマットする(型解決自体が
+    /// `MAX_TYPE_DEPTH` で打ち切られているため、無限再帰にはならない)。
     fn format_struct_value(&self, addr: u64, ty: &dwarf_info::TypeInfo, depth: usize) -> String {
         let members = match ty {
             dwarf_info::TypeInfo::Struct { members, .. } => members,
@@ -934,28 +975,45 @@ impl Debugger {
         let mut parts = Vec::new();
         for m in members.iter().take(max) {
             let member_addr = addr + m.offset;
-            let value_str = match &m.ty {
-                dwarf_info::TypeInfo::Struct { .. } => self.format_struct_value(member_addr, &m.ty, depth + 1),
-                dwarf_info::TypeInfo::Pointer { .. } => match self.read_typed_value(member_addr, &m.ty) {
-                    Ok(v) => format!("{:#x}", v.as_i64() as u64),
-                    Err(_) => "?".to_string(),
-                },
-                _ => match self.read_typed_value(member_addr, &m.ty) {
-                    Ok(expr::Value::Float(f)) => f.to_string(),
-                    Ok(expr::Value::Int(v)) => v.to_string(),
-                    Err(_) => "?".to_string(),
-                },
-            };
-            // ネストした構造体メンバは format_struct_value の再帰呼び出し側で
-            // 既に自分自身の型名を付けているので、ここでは二重に付けない。
-            let value_str = if self.print_pretty && !matches!(m.ty, dwarf_info::TypeInfo::Struct { .. }) {
-                format!("{} ({})", value_str, m.ty.type_name())
-            } else {
-                value_str
-            };
+            let value_str = self.format_value_by_type(member_addr, &m.ty, depth + 1);
             parts.push(format!("{} = {}", m.name, value_str));
         }
         if members.len() > max {
+            parts.push("...".to_string());
+        }
+        if self.print_pretty {
+            let pad = "  ".repeat(depth + 1);
+            let close_pad = "  ".repeat(depth);
+            format!(
+                "({}) {{\n{}{}\n{}}}",
+                ty.type_name(),
+                pad,
+                parts.join(&format!(",\n{}", pad)),
+                close_pad
+            )
+        } else {
+            format!("{{{}}}", parts.join(", "))
+        }
+    }
+
+    /// 配列の値を `{1, 2, 3}` の形式(`set print pretty on` なら複数行
+    /// インデント表示)でフォーマットする。要素数は `set print elements`
+    /// で打ち切る。要素が構造体/配列ならネストして再帰的にフォーマットする。
+    fn format_array_value(&self, addr: u64, ty: &dwarf_info::TypeInfo, depth: usize) -> String {
+        let (element, count) = match ty {
+            dwarf_info::TypeInfo::Array { element, count } => (element.as_ref(), *count),
+            _ => return "?".to_string(),
+        };
+        let total = count.unwrap_or(0);
+        let max = self.print_elements.map(|n| n as u64).unwrap_or(u64::MAX);
+        let shown = total.min(max);
+        let elem_size = element.byte_size().max(1);
+        let mut parts = Vec::new();
+        for i in 0..shown {
+            let elem_addr = addr + i * elem_size;
+            parts.push(self.format_value_by_type(elem_addr, element, depth + 1));
+        }
+        if total > shown {
             parts.push("...".to_string());
         }
         if self.print_pretty {
@@ -990,48 +1048,99 @@ impl Debugger {
         Ok(self.resolve_variable(name)?.0)
     }
 
-    /// `base_name->field1->field2->...` を評価する。`base_name` は
-    /// ローカル変数/仮引数名で、(構造体へのポインタ、または構造体そのもの)
-    /// である必要がある。式の `->` 演算子 (`src/expr.rs`) から呼ばれる。
-    pub fn read_member_chain(&self, base_name: &str, fields: &[String]) -> Result<expr::Value> {
-        let (addr, ty) = self.resolve_member_chain(base_name, fields)?;
+    /// `base_name->field1[i]->field2...` を評価する。`base_name` は
+    /// ローカル変数/仮引数名で、各ステップの起点は(構造体/配列へのポインタ、
+    /// または構造体/配列そのもの)である必要がある。式の `->`/`[]` 演算子
+    /// (`src/expr.rs`) から呼ばれる。
+    pub fn read_member_chain(&self, base_name: &str, steps: &[expr::ChainStep]) -> Result<expr::Value> {
+        let (addr, ty) = self.resolve_member_chain(base_name, steps)?;
         self.read_typed_value(addr, &ty)
     }
 
-    /// `read_member_chain` の書き込み版。`set base->field...=式` から呼ばれる。
-    pub fn write_member_chain(&self, base_name: &str, fields: &[String], value: expr::Value) -> Result<()> {
-        let (addr, ty) = self.resolve_member_chain(base_name, fields)?;
+    /// `read_member_chain` の書き込み版。`set base->field...=式`/
+    /// `set base[i]=式` から呼ばれる。
+    pub fn write_member_chain(&self, base_name: &str, steps: &[expr::ChainStep], value: expr::Value) -> Result<()> {
+        let (addr, ty) = self.resolve_member_chain(base_name, steps)?;
         self.write_typed_value(addr, &ty, value)
     }
 
-    /// `base_name` から `fields` を辿り、最後のメンバの (アドレス, 型) を
-    /// 返す。`read_member_chain`/`write_member_chain` の共通処理。
-    fn resolve_member_chain(&self, base_name: &str, fields: &[String]) -> Result<(u64, dwarf_info::TypeInfo)> {
-        if fields.is_empty() {
-            bail!("'->' の後にメンバ名がありません");
+    /// `print`/`show` 用。最終ステップの型が構造体/配列なら整形済み文字列を
+    /// 返し、それ以外はスカラー値+型情報を返す(`read_for_print` と同様)。
+    pub fn read_chain_for_print(&self, base_name: &str, steps: &[expr::ChainStep]) -> Result<expr::PrintResult> {
+        let (addr, ty) = self.resolve_member_chain(base_name, steps)?;
+        if matches!(ty, dwarf_info::TypeInfo::Struct { .. } | dwarf_info::TypeInfo::Array { .. }) {
+            return Ok(expr::PrintResult::Text(self.format_value_by_type(addr, &ty, 0)));
+        }
+        let value = self.read_typed_value(addr, &ty)?;
+        let is_pointer = matches!(ty, dwarf_info::TypeInfo::Pointer { .. });
+        let hint = expr::TypeHint { is_pointer, type_name: ty.type_name() };
+        Ok(expr::PrintResult::Value(value, Some(hint)))
+    }
+
+    /// `base_name` から `steps` を辿り、最後のステップの (アドレス, 型) を
+    /// 返す。`read_member_chain`/`write_member_chain`/`read_chain_for_print`
+    /// の共通処理。
+    fn resolve_member_chain(&self, base_name: &str, steps: &[expr::ChainStep]) -> Result<(u64, dwarf_info::TypeInfo)> {
+        if steps.is_empty() {
+            bail!("'->' または '[]' の後に何もありません");
         }
         let (addr, var) = self.resolve_variable(base_name)?;
-        let (mut cur_addr, mut cur_ty) = self.deref_if_pointer(addr, &var.ty)?;
+        // 先頭から暗黙のデリファレンスを1回済ませてしまわない: `[i]` は
+        // ポインタ自身の値をベースアドレスとして使う必要があり(配列は
+        // そのまま自分のアドレスを使う)、`->` はポインタなら1回だけ
+        // デリファレンスする必要がある。この2つは要求するデリファレンス
+        // 回数が違うため、各ステップが自分の種類に応じて自分で処理する。
+        let mut cur_addr = addr;
+        let mut cur_ty = var.ty;
         let mut cur_name = base_name.to_string();
-        for (i, field) in fields.iter().enumerate() {
-            let members = match &cur_ty {
-                dwarf_info::TypeInfo::Struct { members, .. } => members,
-                _ => bail!("'{}' は構造体でもポインタでもないため、'->{}' を評価できません", cur_name, field),
+        for (i, step) in steps.iter().enumerate() {
+            let (step_addr, step_ty) = match step {
+                expr::ChainStep::Field(field) => {
+                    let (struct_addr, struct_ty) = self.deref_if_pointer(cur_addr, &cur_ty)?;
+                    let members = match &struct_ty {
+                        dwarf_info::TypeInfo::Struct { members, .. } => members,
+                        _ => bail!(
+                            "'{}' は構造体でもポインタでもないため、'->{}' を評価できません",
+                            cur_name,
+                            field
+                        ),
+                    };
+                    let m = members
+                        .iter()
+                        .find(|m| &m.name == field)
+                        .ok_or_else(|| anyhow!("メンバ '{}' が見つかりません", field))?;
+                    (struct_addr + m.offset, m.ty.clone())
+                }
+                expr::ChainStep::Index(idx) => {
+                    let (base_addr, element_ty) = match &cur_ty {
+                        dwarf_info::TypeInfo::Array { element, .. } => (cur_addr, (**element).clone()),
+                        dwarf_info::TypeInfo::Pointer { pointee } => {
+                            let bytes = self.read_mem(cur_addr, 8)?;
+                            let base = u64::from_ne_bytes(bytes.try_into().unwrap());
+                            (base, (**pointee).clone())
+                        }
+                        _ => bail!(
+                            "'{}' は配列でもポインタでもないため、'[{}]' を評価できません",
+                            cur_name,
+                            idx
+                        ),
+                    };
+                    let elem_size = element_ty.byte_size().max(1);
+                    let elem_addr = (base_addr as i64).wrapping_add(idx.wrapping_mul(elem_size as i64)) as u64;
+                    (elem_addr, element_ty)
+                }
             };
-            let m = members
-                .iter()
-                .find(|m| &m.name == field)
-                .ok_or_else(|| anyhow!("メンバ '{}' が見つかりません", field))?;
-            let member_addr = cur_addr + m.offset;
-            if i + 1 == fields.len() {
-                return Ok((member_addr, m.ty.clone()));
+            cur_addr = step_addr;
+            cur_ty = step_ty;
+            cur_name = match step {
+                expr::ChainStep::Field(f) => f.clone(),
+                expr::ChainStep::Index(idx) => format!("[{}]", idx),
+            };
+            if i + 1 == steps.len() {
+                return Ok((cur_addr, cur_ty));
             }
-            let (next_addr, next_ty) = self.deref_if_pointer(member_addr, &m.ty)?;
-            cur_addr = next_addr;
-            cur_ty = next_ty;
-            cur_name = field.clone();
         }
-        unreachable!("fields が空でなければループ内で必ず return する");
+        unreachable!("steps が空でなければループ内で必ず return する");
     }
 
     /// `ty` がポインタ型なら `addr` に格納されているポインタ値を読んで
@@ -1084,7 +1193,10 @@ impl Debugger {
                 };
                 Ok(expr::Value::Int(value))
             }
-            dwarf_info::TypeInfo::Pointer { .. } | dwarf_info::TypeInfo::Struct { .. } | dwarf_info::TypeInfo::Unknown => {
+            dwarf_info::TypeInfo::Pointer { .. }
+            | dwarf_info::TypeInfo::Struct { .. }
+            | dwarf_info::TypeInfo::Array { .. }
+            | dwarf_info::TypeInfo::Unknown => {
                 let bytes = self.read_mem(addr, 8)?;
                 Ok(expr::Value::Int(i64::from_ne_bytes(bytes.try_into().unwrap())))
             }
@@ -1112,7 +1224,9 @@ impl Debugger {
                 self.write_mem(addr, &bytes)
             }
             dwarf_info::TypeInfo::Pointer { .. } => self.write_mem(addr, &value.as_i64().to_ne_bytes()),
-            dwarf_info::TypeInfo::Struct { .. } | dwarf_info::TypeInfo::Unknown => {
+            dwarf_info::TypeInfo::Struct { .. }
+            | dwarf_info::TypeInfo::Array { .. }
+            | dwarf_info::TypeInfo::Unknown => {
                 bail!("この型への書き込みには対応していません")
             }
         }

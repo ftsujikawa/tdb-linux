@@ -20,12 +20,15 @@ const HELP: &str = "\
   syms [絞り込み文字列]      ELFのシンボル(関数)一覧を表示する
   lines [関数名]             行番号情報(アドレス・ファイル・行番号)を表示する(DWARF情報が必要)
   info registers, i r       レジスタを表示する
-  print <式>, p <式>        式を評価して表示する (例: p $rax, p x+1, p *$rsp, p &x, p ptr->field)
+  print <式>, p <式>        式を評価して表示する (例: p $rax, p x+1, p *$rsp,
+                              p &x, p ptr->field, p ptr.field, p arr, p arr[0],
+                              p arr[0]->x)
   print/fmt <式>            フォーマット指定して表示する (fmt: x=16進 o=8進
                               t=2進 d/i=10進 c=文字 s=文字列, 例: p/x $rax)
   set $<reg>=<式>           レジスタに式の評価値を設定する
   set <変数名>=<式>         ローカル変数/仮引数に式の評価値を設定する(DWARF情報が必要)
-  set <変数名>-><メンバ>=<式>  構造体メンバに式の評価値を設定する(DWARF情報が必要)
+  set <変数名>-><メンバ>=<式>  構造体メンバに式の評価値を設定する(->と.は同じ意味、DWARF情報が必要)
+  set <変数名>[<添字>]=<式>    配列/ポインタの要素に式の評価値を設定する(DWARF情報が必要)
   set print pretty on|off   構造体を複数行インデント表示するか(既定 off)
   set print elements <n>|unlimited
                             文字列(/s)/構造体表示の要素数上限(既定 200)
@@ -202,7 +205,7 @@ fn handle_print(dbg: &mut Debugger, fmt: Option<&str>, rest: &[&str]) -> anyhow:
 
     match fmt {
         None => match result {
-            expr::PrintResult::Struct(s) => println!("{} = {}", text, s),
+            expr::PrintResult::Text(s) => println!("{} = {}", text, s),
             expr::PrintResult::Value(expr::Value::Float(f), hint) => match hint {
                 Some(h) if dbg.print_pretty() => println!("{} = ({}){}", text, h.type_name, f),
                 _ => println!("{} = {}", text, f),
@@ -219,8 +222,8 @@ fn handle_print(dbg: &mut Debugger, fmt: Option<&str>, rest: &[&str]) -> anyhow:
         },
         Some(f) => {
             let value = match result {
-                expr::PrintResult::Struct(_) => {
-                    anyhow::bail!("構造体にはフォーマット指定 (/{}) は使えません", f)
+                expr::PrintResult::Text(_) => {
+                    anyhow::bail!("構造体/配列にはフォーマット指定 (/{}) は使えません", f)
                 }
                 expr::PrintResult::Value(v, _) => v,
             };
@@ -320,7 +323,9 @@ fn handle_set(dbg: &mut Debugger, first_tok: &str, rest_toks: &[&str]) -> anyhow
     let (target, val_expr) = full
         .split_once('=')
         .ok_or_else(|| {
-            anyhow::anyhow!("使い方: set $<レジスタ名>=<式> | set *<addr式>=<式> | set <変数名>=<式> | set <変数名>-><メンバ名>=<式>")
+            anyhow::anyhow!(
+                "使い方: set $<レジスタ名>=<式> | set *<addr式>=<式> | set <変数名>=<式> | set <変数名>-><メンバ名>=<式> | set <変数名>.<メンバ名>=<式> | set <変数名>[<添字>]=<式>"
+            )
         })?;
     let target = target.trim();
     let value = expr::eval(val_expr.trim(), dbg)?;
@@ -335,13 +340,10 @@ fn handle_set(dbg: &mut Debugger, first_tok: &str, rest_toks: &[&str]) -> anyhow
         return dbg.set_reg(reg_name, value.as_i64() as u64);
     }
 
-    if target.contains("->") {
-        let parts: Vec<&str> = target.split("->").map(str::trim).collect();
-        if parts.len() < 2 || parts.iter().any(|p| p.is_empty()) {
-            anyhow::bail!("使い方: set <変数名>-><メンバ名>[-><メンバ名>...]=<式>");
+    if let Some((base, steps)) = expr::parse_pure_chain(target, dbg)? {
+        if !steps.is_empty() {
+            return dbg.write_member_chain(&base, &steps, value);
         }
-        let fields: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
-        return dbg.write_member_chain(parts[0], &fields, value);
     }
 
     dbg.write_variable(target, value)

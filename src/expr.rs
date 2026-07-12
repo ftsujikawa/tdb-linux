@@ -70,8 +70,21 @@ enum Token {
     Shl,
     Shr,
     Arrow,
+    /// `.` (構造体メンバアクセス)。このツールでは `->` と意味を区別せず、
+    /// どちらも同じ `ChainStep::Field` を生成する完全な別名として扱う。
+    Dot,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
+}
+
+/// `->field`/`.field`(構造体メンバ)または `[i]`(配列/ポインタの添字)の
+/// 1ステップ。`a->b[2].c` のように混在・連鎖できる。
+#[derive(Debug, Clone)]
+pub enum ChainStep {
+    Field(String),
+    Index(i64),
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>> {
@@ -132,6 +145,18 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             }
             ')' => {
                 tokens.push(Token::RParen);
+                i += 1;
+            }
+            '[' => {
+                tokens.push(Token::LBracket);
+                i += 1;
+            }
+            ']' => {
+                tokens.push(Token::RBracket);
+                i += 1;
+            }
+            '.' => {
+                tokens.push(Token::Dot);
                 i += 1;
             }
             '<' if chars.get(i + 1) == Some(&'<') => {
@@ -375,25 +400,51 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// 後置の `->` によるメンバアクセス連鎖 (`a->b->c`)。`Ident` の直後に
-    /// `->` が続く場合のみ特別扱いする。`base_name` の DWARF 型情報が必要
-    /// なため、連鎖の先頭は裸の変数名でなければならない。
+    /// 後置の `->field` / `.field` / `[式]` によるメンバ/添字アクセス連鎖
+    /// (`a->b[2].c` のように混在・連鎖できる)。`Ident` の直後にそのいずれか
+    /// が続く場合のみ特別扱いする。`base_name` の DWARF 型情報が必要なため、
+    /// 連鎖の先頭は裸の変数名でなければならない。
     fn parse_postfix(&mut self) -> Result<Value> {
         if let Some(Token::Ident(name)) = self.peek().cloned() {
-            if self.tokens.get(self.pos + 1) == Some(&Token::Arrow) {
+            if matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Arrow) | Some(Token::Dot) | Some(Token::LBracket)
+            ) {
                 self.advance(); // Ident
-                let mut fields = Vec::new();
-                while matches!(self.peek(), Some(Token::Arrow)) {
-                    self.advance(); // '->'
-                    match self.advance() {
-                        Some(Token::Ident(field)) => fields.push(field),
-                        other => bail!("'->' の後にはメンバ名が必要です (与えられたもの: {:?})", other),
-                    }
+                let mut steps = Vec::new();
+                while let Some(step) = self.try_consume_chain_step()? {
+                    steps.push(step);
                 }
-                return self.dbg.read_member_chain(&name, &fields);
+                return self.dbg.read_member_chain(&name, &steps);
             }
         }
         self.parse_primary()
+    }
+
+    /// 現在位置が `->field` / `.field` / `[式]` ならそれを1ステップとして
+    /// 消費して返す。どれでもなければ何も消費せず `None` を返す。`->` と
+    /// `.` は完全な別名として同じ扱い。添字の中身は完全な式として
+    /// 再帰的に評価する(`arr[i+1]` 等も可)。
+    fn try_consume_chain_step(&mut self) -> Result<Option<ChainStep>> {
+        match self.peek() {
+            Some(Token::Arrow) | Some(Token::Dot) => {
+                let op = if matches!(self.peek(), Some(Token::Arrow)) { "->" } else { "." };
+                self.advance();
+                match self.advance() {
+                    Some(Token::Ident(field)) => Ok(Some(ChainStep::Field(field))),
+                    other => bail!("'{}' の後にはメンバ名が必要です (与えられたもの: {:?})", op, other),
+                }
+            }
+            Some(Token::LBracket) => {
+                self.advance();
+                let idx_val = self.parse_expr()?;
+                match self.advance() {
+                    Some(Token::RBracket) => Ok(Some(ChainStep::Index(idx_val.as_i64()))),
+                    other => bail!("'[' に対応する ']' がありません (与えられたもの: {:?})", other),
+                }
+            }
+            _ => Ok(None),
+        }
     }
 
     fn parse_primary(&mut self) -> Result<Value> {
@@ -436,19 +487,19 @@ pub struct TypeHint {
     pub type_name: String,
 }
 
-/// `print` 専用の評価結果。式全体が単一の変数名で、その型が構造体の場合は
-/// `Struct` として整形済みの表示文字列 (`set print pretty`/`set print
-/// elements` を反映済み) を返す。それ以外は従来通り `Value` を返す。
-/// `Value` に添える `Option<TypeHint>` は、式全体が単一の変数名、または
-/// `&<変数名>` の場合に限り DWARF の型情報から分かる。レジスタ・リテラル・
-/// 演算を含む式など、静的な型情報を持たない場合は `None`。
+/// `print` 専用の評価結果。式全体が単一の変数名(または `->`/`[]` の連鎖)で、
+/// その型が構造体/配列の場合は `Text` として整形済みの表示文字列
+/// (`set print pretty`/`set print elements` を反映済み) を返す。それ以外は
+/// 従来通り `Value` を返す。`Value` に添える `Option<TypeHint>` は、式全体が
+/// 単一の変数名、または `&<変数名>` の場合に限り DWARF の型情報から分かる。
+/// レジスタ・リテラル・演算を含む式など、静的な型情報を持たない場合は `None`。
 pub enum PrintResult {
     Value(Value, Option<TypeHint>),
-    Struct(String),
+    Text(String),
 }
 
 /// `eval` と同様に式を評価するが、`print` の表示形式を決めるための型情報
-/// (ポインタかどうか・型名、構造体なら整形済み文字列)も併せて求める。
+/// (ポインタかどうか・型名、構造体/配列なら整形済み文字列)も併せて求める。
 pub fn eval_typed(input: &str, dbg: &Debugger) -> Result<PrintResult> {
     let trimmed = input.trim();
     if is_bare_ident(trimmed) {
@@ -460,7 +511,38 @@ pub fn eval_typed(input: &str, dbg: &Debugger) -> Result<PrintResult> {
             return dbg.read_address_for_print(inner);
         }
     }
+    if let Some((base, steps)) = parse_pure_chain(trimmed, dbg)? {
+        return dbg.read_chain_for_print(&base, &steps);
+    }
     Ok(PrintResult::Value(eval(input, dbg)?, None))
+}
+
+/// 入力全体が「変数名に `->field`/`.field`/`[式]` の連鎖だけが続く」形に
+/// なっているかを判定し、そうであれば `(変数名, ステップ列)` を返す。
+/// それ以外の演算子が混じっている場合や、そもそも変数名から始まっていない
+/// 場合は `None`。`print`/`set` が構造体/配列を整形表示するかどうかの判定
+/// に使う(単純な `eval` では連鎖の最終結果がスカラーに変換されてしまう
+/// ため)。
+pub fn parse_pure_chain(input: &str, dbg: &Debugger) -> Result<Option<(String, Vec<ChainStep>)>> {
+    let tokens = tokenize(input)?;
+    if !matches!(tokens.first(), Some(Token::Ident(_))) {
+        return Ok(None);
+    }
+    if !matches!(tokens.get(1), Some(Token::Arrow) | Some(Token::Dot) | Some(Token::LBracket)) {
+        return Ok(None);
+    }
+    let mut parser = Parser { tokens, pos: 0, dbg };
+    let Some(Token::Ident(base)) = parser.advance() else {
+        unreachable!("直前に Ident であることを確認済み");
+    };
+    let mut steps = Vec::new();
+    while let Some(step) = parser.try_consume_chain_step()? {
+        steps.push(step);
+    }
+    if parser.pos != parser.tokens.len() {
+        return Ok(None); // 末尾に演算子等が残っている場合は「純粋な連鎖」ではない
+    }
+    Ok(Some((base, steps)))
 }
 
 fn is_bare_ident(s: &str) -> bool {
