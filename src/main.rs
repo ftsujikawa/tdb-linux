@@ -4,6 +4,7 @@ mod disasm;
 mod dwarf_info;
 mod elf_info;
 mod expr;
+mod leak;
 mod registers;
 mod repl;
 

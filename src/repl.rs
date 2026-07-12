@@ -19,6 +19,11 @@ const HELP: &str = "\
   backtrace, bt             コールスタックを表示する
   syms [絞り込み文字列]      ELFのシンボル(関数)一覧を表示する
   lines [関数名]             行番号情報(アドレス・ファイル・行番号)を表示する(DWARF情報が必要)
+  list, l                   ソースコードを表示する(現在位置、無ければ main を中心に10行)
+  list <関数名>              その関数の先頭を中心にソースコードを表示する(DWARF情報が必要)
+  list <行番号>              現在位置(または main)と同じファイルのその行を中心に表示する
+  list <ファイル>:<行番号>    指定ファイルのその行を中心に表示する(DWARF情報が必要)
+  list *<addr>              アドレス(16進、実行中はランタイムアドレス)に対応する行を表示する
   info registers, i r       レジスタを表示する
   print <式>, p <式>        式を評価して表示する (例: p $rax, p x+1, p *$rsp,
                               p &x, p ptr->field, p ptr.field, p arr, p arr[0],
@@ -38,6 +43,9 @@ const HELP: &str = "\
   show globals               グローバル変数の一覧を表示する(DWARF情報が必要)
   x/<n> <addr>              メモリをバイト列として表示する
   set *<addr式>=<式>        メモリを1バイト書き換える (例: set *0x4011a0=0x90)
+  leak on|off               メモリリーク追跡(malloc/calloc/realloc/free)を有効/無効化する
+  leak                      メモリリーク追跡の状態(on/off・確保/解放回数)を表示する
+  leaks                     未解放のヒープ確保一覧を表示する(leak on かつ continue 実行が必要)
   kill, k                   実行中のプロセスを終了する
   help, h, ?                このヘルプを表示する
   quit, q                   デバッガを終了する
@@ -120,6 +128,29 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
         }
         "lines" => {
             dbg.list_lines(rest.first().copied());
+            Ok(())
+        }
+        "list" | "l" => dbg.list_source(rest.first().copied()),
+        "leak" => match rest.first().copied() {
+            Some("on") => {
+                dbg.set_leak_tracking(true);
+                Ok(())
+            }
+            Some("off") => {
+                dbg.set_leak_tracking(false);
+                Ok(())
+            }
+            None => {
+                dbg.show_leak_status();
+                Ok(())
+            }
+            Some(other) => {
+                println!("不明な引数: '{}' (使い方: leak on | leak off | leak)", other);
+                Ok(())
+            }
+        },
+        "leaks" => {
+            dbg.list_leaks();
             Ok(())
         }
         "print" | "p" => handle_print(dbg, None, &rest),

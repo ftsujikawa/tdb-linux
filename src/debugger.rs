@@ -3,8 +3,10 @@ use crate::disasm;
 use crate::dwarf_info::{self, DwarfInfo};
 use crate::elf_info::{ElfInfo, Symbol};
 use crate::expr;
+use crate::leak::{self, LeakTracker};
 use crate::registers;
 use anyhow::{anyhow, bail, Context, Result};
+use goblin::elf::Elf;
 use nix::sys::personality::{self, Persona};
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
@@ -66,6 +68,13 @@ pub struct Debugger {
     /// `set print elements <n>|unlimited`。文字列 (`/s`) や構造体表示の
     /// 要素数上限 (GDB のデフォルトである 200 に合わせる)。`None` は無制限。
     print_elements: Option<usize>,
+    /// `leak on/off`/`leaks` で使うメモリリーク追跡状態。
+    leak: LeakTracker,
+    /// `nexti`/`up` が `cont()` 経由で待っている「ここで止まってほしい」
+    /// 一時ブレークポイントのアドレス。メモリリーク追跡用の戻り値捕捉
+    /// ブレークポイントが偶然同じアドレスになった場合に、追跡側が
+    /// 勝手に実行を継続してしまわないようにするために参照する。
+    skip_target: Option<u64>,
 }
 
 /// `step`/`next` の1回の実行(単一命令の実行、または call をまたぐ実行)の
@@ -98,6 +107,8 @@ impl Debugger {
             exited: false,
             print_pretty: false,
             print_elements: Some(200),
+            leak: LeakTracker::default(),
+            skip_target: None,
         })
     }
 
@@ -143,6 +154,7 @@ impl Debugger {
         self.breakpoints.clear();
         self.bp_ids.clear();
         self.exited = false;
+        self.leak.reset_for_run();
 
         let path = CString::new(self.program.as_os_str().to_str().unwrap())?;
         let mut c_args: Vec<CString> = vec![path.clone()];
@@ -362,9 +374,16 @@ impl Debugger {
         if self.exited {
             return Ok(());
         }
+        if self.leak.enabled {
+            self.ensure_leak_breakpoints_installed();
+        }
         let pid = self.pid()?;
         ptrace::cont(pid, None)?;
-        self.wait_and_report()
+        let result = self.wait_and_report();
+        if self.leak.enabled {
+            self.uninstall_leak_breakpoints();
+        }
+        result
     }
 
     pub fn stepi(&mut self) -> Result<()> {
@@ -391,7 +410,9 @@ impl Debugger {
                 tmp.enable(pid)?;
                 self.breakpoints.insert(ret_addr, tmp);
             }
+            let prev_target = self.skip_target.replace(ret_addr);
             self.cont()?;
+            self.skip_target = prev_target;
             if !had_bp && !self.exited {
                 if let Some(mut bp) = self.breakpoints.remove(&ret_addr) {
                     bp.disable(pid)?;
@@ -685,7 +706,9 @@ impl Debugger {
             tmp.enable(pid)?;
             self.breakpoints.insert(ret_addr, tmp);
         }
+        let prev_target = self.skip_target.replace(ret_addr);
         self.cont()?;
+        self.skip_target = prev_target;
         if !had_bp && !self.exited {
             if let Some(mut bp) = self.breakpoints.remove(&ret_addr) {
                 bp.disable(pid)?;
@@ -694,35 +717,332 @@ impl Debugger {
         Ok(())
     }
 
+    /// `waitpid` の結果を報告する。メモリリーク追跡用の内部ブレークポイント
+    /// (malloc 等のエントリ/戻りアドレス捕捉)を踏んだ場合は、その場で
+    /// 追跡処理(`handle_leak_breakpoint`)だけを行って報告はせず、
+    /// そのブレークポイントを一時的に元へ戻して1命令実行→再度 `continue`
+    /// してループを続ける(ユーザーには見えない)。
     fn wait_and_report(&mut self) -> Result<()> {
-        let pid = self.pid()?;
-        match waitpid(pid, None)? {
-            WaitStatus::Exited(_, code) => {
-                self.mark_exited();
-                println!("[プロセスは終了しました (code={})]", code);
-            }
-            WaitStatus::Signaled(_, sig, _) => {
-                self.mark_exited();
-                println!("[プロセスはシグナル {} で終了しました]", sig);
-            }
-            WaitStatus::Stopped(_, Signal::SIGTRAP) => {
-                let mut regs = registers::get_regs(pid)?;
-                let bp_addr = regs.rip.wrapping_sub(1);
-                if self.breakpoints.contains_key(&bp_addr) {
-                    regs.rip = bp_addr;
-                    registers::set_regs(pid, &regs)?;
-                    let sym = self.symbol_at(bp_addr);
-                    println!("ブレークポイントで停止: {:#x} <{}>", bp_addr, sym);
-                    self.show_stop_location(bp_addr);
-                } else {
-                    println!("停止 (SIGTRAP): rip={:#x}", regs.rip);
+        loop {
+            let pid = self.pid()?;
+            match waitpid(pid, None)? {
+                WaitStatus::Exited(_, code) => {
+                    self.mark_exited();
+                    println!("[プロセスは終了しました (code={})]", code);
+                    return Ok(());
+                }
+                WaitStatus::Signaled(_, sig, _) => {
+                    self.mark_exited();
+                    println!("[プロセスはシグナル {} で終了しました]", sig);
+                    return Ok(());
+                }
+                WaitStatus::Stopped(_, Signal::SIGTRAP) => {
+                    let mut regs = registers::get_regs(pid)?;
+                    let bp_addr = regs.rip.wrapping_sub(1);
+                    if self.breakpoints.contains_key(&bp_addr) {
+                        regs.rip = bp_addr;
+                        registers::set_regs(pid, &regs)?;
+                        if self.leak.enabled && self.handle_leak_breakpoint(bp_addr)? {
+                            self.step_over_current_breakpoint()?;
+                            if self.exited {
+                                return Ok(());
+                            }
+                            ptrace::cont(pid, None)?;
+                            continue;
+                        }
+                        let sym = self.symbol_at(bp_addr);
+                        println!("ブレークポイントで停止: {:#x} <{}>", bp_addr, sym);
+                        self.show_stop_location(bp_addr);
+                        return Ok(());
+                    } else {
+                        println!("停止 (SIGTRAP): rip={:#x}", regs.rip);
+                        return Ok(());
+                    }
+                }
+                WaitStatus::Stopped(_, sig) => {
+                    println!("シグナル {} を受信して停止しました", sig);
+                    return Ok(());
+                }
+                other => {
+                    println!("予期しない wait 状態: {:?}", other);
+                    return Ok(());
                 }
             }
-            WaitStatus::Stopped(_, sig) => {
-                println!("シグナル {} を受信して停止しました", sig);
+        }
+    }
+
+    // ---- メモリリーク検出 ----
+
+    /// `leak on`/`leak off`。無効化時は、その場でインストール済みの
+    /// 追跡用ブレークポイントを取り除く(有効化時は次回の `continue` で
+    /// 遅延解決・設置する)。
+    pub fn set_leak_tracking(&mut self, on: bool) {
+        self.leak.enabled = on;
+        if !on {
+            self.uninstall_leak_breakpoints();
+        }
+        println!("メモリリーク追跡: {}", if on { "on" } else { "off" });
+    }
+
+    /// 現在の追跡状態(on/off・確保/解放回数・未解決の free)を表示する。
+    pub fn show_leak_status(&self) {
+        println!("メモリリーク追跡: {}", if self.leak.enabled { "on" } else { "off" });
+        println!(
+            "確保: {} 回, 解放: {} 回, 未解放: {} 件, 追跡外への free: {} 件",
+            self.leak.total_allocs,
+            self.leak.total_frees,
+            self.leak.live.len(),
+            self.leak.bad_frees.len()
+        );
+    }
+
+    /// 未解放のヒープ確保一覧を表示する (`leaks` コマンド)。
+    pub fn list_leaks(&self) {
+        if !self.leak.enabled {
+            println!("メモリリーク追跡は無効です ('leak on' で有効にしてください)");
+            return;
+        }
+        if self.leak.live.is_empty() {
+            println!(
+                "未解放のヒープ確保はありません (確保 {} 回, 解放 {} 回)",
+                self.leak.total_allocs, self.leak.total_frees
+            );
+        } else {
+            let mut items: Vec<(&u64, &leak::LiveAlloc)> = self.leak.live.iter().collect();
+            items.sort_by_key(|(addr, _)| **addr);
+            let total: u64 = items.iter().map(|(_, a)| a.size).sum();
+            println!("未解放のヒープ確保: {} 件, 合計 {} バイト", items.len(), total);
+            for (addr, alloc) in items {
+                let loc = self
+                    .dwarf
+                    .lookup(alloc.call_site)
+                    .map(|row| format!("{}:{}", row.file.display(), row.line))
+                    .unwrap_or_else(|| format!("{:#x}", self.runtime_addr(alloc.call_site)));
+                println!("  {:#018x}  {:>8} バイト  確保元: {}", addr, alloc.size, loc);
             }
-            other => {
-                println!("予期しない wait 状態: {:?}", other);
+        }
+        if !self.leak.bad_frees.is_empty() {
+            println!("警告: 追跡外のポインタへの free (二重解放の可能性): {} 件", self.leak.bad_frees.len());
+            for p in &self.leak.bad_frees {
+                println!("  {:#018x}", p);
+            }
+        }
+    }
+
+    /// エントリブレークポイントが未解決であれば解決し、まだ設置していない
+    /// ものを設置する。`continue` のたびに呼ぶ(冪等)。libc がまだ
+    /// マップされていない(ロード直後で ld.so がまだ起動していない)場合は
+    /// 何もせず、次回の `continue` で再試行する。
+    fn ensure_leak_breakpoints_installed(&mut self) {
+        if self.leak.entries.is_empty() {
+            if let Err(e) = self.resolve_leak_entry_points() {
+                eprintln!("警告: メモリリーク追跡対象の関数解決に失敗しました: {}", e);
+                return;
+            }
+        }
+        let Some(pid) = self.pid else { return };
+        let addrs: Vec<u64> = self.leak.entries.keys().copied().collect();
+        for addr in addrs {
+            if !self.breakpoints.contains_key(&addr) {
+                let mut bp = Breakpoint::new(addr);
+                if bp.enable(pid).is_ok() {
+                    self.breakpoints.insert(addr, bp);
+                }
+            }
+        }
+    }
+
+    /// `ensure_leak_breakpoints_installed` で設置したブレークポイントを
+    /// 取り除く。ユーザーが `break` で設置した実ブレークポイントと
+    /// アドレスが重複している場合はそちらを優先し、取り除かない。
+    fn uninstall_leak_breakpoints(&mut self) {
+        let Some(pid) = self.pid else {
+            self.leak.pending.clear();
+            return;
+        };
+        let entry_addrs: Vec<u64> = self.leak.entries.keys().copied().collect();
+        for addr in entry_addrs {
+            if self.bp_ids.values().any(|&a| a == addr) {
+                continue;
+            }
+            if let Some(mut bp) = self.breakpoints.remove(&addr) {
+                let _ = bp.disable(pid);
+            }
+        }
+        let pending_addrs: Vec<u64> = self.leak.pending.keys().copied().collect();
+        for addr in pending_addrs {
+            if self.bp_ids.values().any(|&a| a == addr) {
+                continue;
+            }
+            if let Some(mut bp) = self.breakpoints.remove(&addr) {
+                let _ = bp.disable(pid);
+            }
+        }
+        self.leak.pending.clear();
+    }
+
+    /// malloc/calloc/realloc/free のアドレスを解決する。まずスタティック
+    /// リンクバイナリを想定して自分自身の ELF シンボルテーブルを見て
+    /// (静的リンクなら定義済みシンボルとして存在する)、見つからなかった
+    /// 分だけ `/proc/pid/maps` から libc の実行時ロードアドレスを求め、
+    /// libc 自身の `.dynsym` を読んで解決する(動的リンクの通常のケース)。
+    fn resolve_leak_entry_points(&mut self) -> Result<()> {
+        let names: [(&str, leak::AllocFn); 4] = [
+            ("malloc", leak::AllocFn::Malloc),
+            ("calloc", leak::AllocFn::Calloc),
+            ("realloc", leak::AllocFn::Realloc),
+            ("free", leak::AllocFn::Free),
+        ];
+        let mut found: HashMap<u64, leak::AllocFn> = HashMap::new();
+        let mut resolved_names: Vec<&str> = Vec::new();
+
+        for (name, func) in &names {
+            if let Some(sym) = self.elf.find_by_name(name) {
+                if sym.addr != 0 {
+                    found.insert(self.runtime_addr(sym.addr), *func);
+                    resolved_names.push(name);
+                }
+            }
+        }
+
+        if resolved_names.len() < names.len() {
+            if let Some((base, path)) = self.find_libc_mapping()? {
+                let libc_syms = load_dynamic_symbols(&path)?;
+                for (name, func) in &names {
+                    if resolved_names.contains(name) {
+                        continue;
+                    }
+                    if let Some(&val) = libc_syms.get(*name) {
+                        found.insert(base + val, *func);
+                    }
+                }
+            }
+        }
+
+        self.leak.entries = found;
+        Ok(())
+    }
+
+    /// `/proc/<pid>/maps` から libc.so のマッピングを探し、その実行時
+    /// ロードアドレス(先頭マッピングの開始アドレス。`detect_load_bias` と
+    /// 同じ考え方)とファイルパスを返す。まだマップされていなければ `None`。
+    fn find_libc_mapping(&self) -> Result<Option<(u64, PathBuf)>> {
+        let pid = self.pid()?;
+        let maps = fs::read_to_string(format!("/proc/{}/maps", pid.as_raw()))
+            .context("failed to read /proc/pid/maps")?;
+        for line in maps.lines() {
+            let Some(path_part) = line.split_whitespace().last() else { continue };
+            let base_name = Path::new(path_part).file_name().and_then(|f| f.to_str()).unwrap_or("");
+            if base_name.starts_with("libc.so") || base_name.starts_with("libc-") {
+                let addr_range = line.split_whitespace().next().unwrap_or("");
+                let start = addr_range.split('-').next().unwrap_or("0");
+                let base = u64::from_str_radix(start, 16).unwrap_or(0);
+                return Ok(Some((base, PathBuf::from(path_part))));
+            }
+        }
+        Ok(None)
+    }
+
+    /// ブレークポイントのヒットがメモリリーク追跡用のものであれば処理して
+    /// `true` を返す(呼び出し元はユーザーへの報告をせず、静かに実行を
+    /// 再開してよい)。ただし、そのアドレスがユーザーの実ブレークポイント、
+    /// または `nexti`/`up` が待っている一時停止先 (`skip_target`) と
+    /// 重複する場合は、追跡処理だけ済ませたうえで `false` を返し、
+    /// 本来の(ユーザーに見える)停止処理に委ねる。
+    fn handle_leak_breakpoint(&mut self, addr: u64) -> Result<bool> {
+        if let Some(func) = self.leak.entries.get(&addr).copied() {
+            self.on_alloc_entry(func)?;
+            let is_user_bp = self.bp_ids.values().any(|&a| a == addr);
+            return Ok(!is_user_bp);
+        }
+        if self.leak.pending.contains_key(&addr) {
+            self.on_alloc_return(addr)?;
+            let is_awaited_stop =
+                self.bp_ids.values().any(|&a| a == addr) || self.skip_target == Some(addr);
+            return Ok(!is_awaited_stop);
+        }
+        Ok(false)
+    }
+
+    /// malloc/calloc/realloc/free のエントリ(先頭アドレス)に到達した際の
+    /// 処理。`free` は引数だけで完結するのでその場で解放を記録する。
+    /// malloc/calloc/realloc は戻り値(確保されたポインタ)が必要なので、
+    /// 戻りアドレスに一時ブレークポイントを置いて `pending` に積む。
+    fn on_alloc_entry(&mut self, func: leak::AllocFn) -> Result<()> {
+        let pid = self.pid()?;
+        let regs = registers::get_regs(pid)?;
+        let ret_bytes = self.read_mem(regs.rsp, 8)?;
+        let ret_addr = u64::from_ne_bytes(ret_bytes.try_into().unwrap());
+        let call_site = ret_addr.wrapping_sub(self.load_bias);
+
+        match func {
+            leak::AllocFn::Free => {
+                let ptr = regs.rdi;
+                if ptr != 0 {
+                    if self.leak.live.remove(&ptr).is_some() {
+                        self.leak.total_frees += 1;
+                    } else {
+                        self.leak.bad_frees.push(ptr);
+                    }
+                }
+            }
+            leak::AllocFn::Malloc | leak::AllocFn::Calloc | leak::AllocFn::Realloc => {
+                let size = match func {
+                    leak::AllocFn::Malloc => regs.rdi,
+                    leak::AllocFn::Calloc => regs.rdi.saturating_mul(regs.rsi),
+                    leak::AllocFn::Realloc => regs.rsi,
+                    leak::AllocFn::Free => unreachable!(),
+                };
+                let old_ptr = if func == leak::AllocFn::Realloc { regs.rdi } else { 0 };
+                if !self.breakpoints.contains_key(&ret_addr) {
+                    let mut bp = Breakpoint::new(ret_addr);
+                    bp.enable(pid)?;
+                    self.breakpoints.insert(ret_addr, bp);
+                }
+                self.leak.pending.insert(ret_addr, leak::PendingCall { func, size, old_ptr, call_site });
+            }
+        }
+        Ok(())
+    }
+
+    /// malloc/calloc/realloc の戻りアドレスに到達した際の処理。`rax` を
+    /// 確保されたポインタとして取り込み、`live` を更新する。
+    fn on_alloc_return(&mut self, addr: u64) -> Result<()> {
+        let Some(pending) = self.leak.pending.remove(&addr) else {
+            return Ok(());
+        };
+        let pid = self.pid()?;
+        let regs = registers::get_regs(pid)?;
+        let ptr = regs.rax;
+
+        match pending.func {
+            leak::AllocFn::Malloc | leak::AllocFn::Calloc => {
+                if ptr != 0 {
+                    self.leak.live.insert(ptr, leak::LiveAlloc { size: pending.size, call_site: pending.call_site });
+                    self.leak.total_allocs += 1;
+                }
+            }
+            leak::AllocFn::Realloc => {
+                if ptr != 0 {
+                    if pending.old_ptr != 0 {
+                        self.leak.live.remove(&pending.old_ptr);
+                    }
+                    self.leak.live.insert(ptr, leak::LiveAlloc { size: pending.size, call_site: pending.call_site });
+                    self.leak.total_allocs += 1;
+                } else if pending.size == 0 && pending.old_ptr != 0 {
+                    // realloc(ptr, 0) は多くの実装で free 相当として扱われる。
+                    self.leak.live.remove(&pending.old_ptr);
+                    self.leak.total_frees += 1;
+                }
+                // ptr == 0 かつ size != 0 は失敗: 元のブロックは変更されない
+                // ため、追跡状態も変更しない。
+            }
+            leak::AllocFn::Free => unreachable!("free はエントリ時点で即座に処理するため pending には入らない"),
+        }
+
+        if !self.bp_ids.values().any(|&a| a == addr) {
+            if let Some(mut bp) = self.breakpoints.remove(&addr) {
+                bp.disable(pid)?;
             }
         }
         Ok(())
@@ -1431,6 +1751,136 @@ impl Debugger {
         }
     }
 
+    /// ソースコードを表示する (`list` コマンド)。`spec` の形式によって
+    /// 表示位置の決め方を変える:
+    /// - 指定なし: 実行中なら現在の PC の行、そうでなければ `main` 関数の行。
+    /// - `*<addr>` (シンボル/アドレス指定): アドレスに対応する行番号情報を
+    ///   DWARF 行テーブルから引く(実行中はランタイムアドレス、未実行なら
+    ///   リンク時アドレスとして解釈する。`break *<addr>` と同じ慣習)。
+    /// - 数値のみ: 行番号として扱い、直近の実行位置(または `main`)と
+    ///   同じファイル内のその行を表示する。
+    /// - `<ファイル>:<行番号>`: 行番号情報からファイル名が一致する行を探し、
+    ///   そのファイルの指定行を表示する。
+    /// - それ以外: 関数名として ELF シンボルテーブルから探し、その関数の
+    ///   先頭アドレスに対応する行を表示する。
+    pub fn list_source(&self, spec: Option<&str>) -> Result<()> {
+        let (file, line) = match spec {
+            None => self.current_source_location()?,
+            Some(s) => {
+                let s = s.trim();
+                if let Some(hex) = s.strip_prefix('*') {
+                    self.location_from_address(hex)?
+                } else if let Ok(n) = s.parse::<u32>() {
+                    (self.current_source_location()?.0, n)
+                } else if let Some((file_part, line_part)) = s.rsplit_once(':') {
+                    let n: u32 = line_part
+                        .trim()
+                        .parse()
+                        .with_context(|| format!("行番号の解析に失敗しました: '{}'", line_part))?;
+                    let file = self
+                        .resolve_source_file(file_part.trim())
+                        .ok_or_else(|| anyhow!("ファイル '{}' の行番号情報が見つかりません", file_part))?;
+                    (file, n)
+                } else {
+                    self.location_from_function(s)?
+                }
+            }
+        };
+        self.show_source_window(&file, line);
+        Ok(())
+    }
+
+    /// 実行中なら現在の PC の(ファイル, 行番号)、そうでなければ `main`
+    /// 関数の(ファイル, 行番号)を返す。`list` の指定省略時・数値のみ
+    /// 指定時のデフォルト位置決めに使う。
+    fn current_source_location(&self) -> Result<(PathBuf, u32)> {
+        if self.is_running() {
+            let pid = self.pid()?;
+            let regs = registers::get_regs(pid)?;
+            let link_pc = regs.rip.wrapping_sub(self.load_bias);
+            if let Some(row) = self.dwarf.lookup(link_pc) {
+                return Ok((row.file.clone(), row.line));
+            }
+        }
+        let sym = self
+            .elf
+            .find_by_name("main")
+            .ok_or_else(|| anyhow!("表示位置を特定できません。関数名か 'ファイル:行番号' を指定してください"))?;
+        let row = self
+            .dwarf
+            .lookup(sym.addr)
+            .ok_or_else(|| anyhow!("表示位置を特定できません(DWARF情報がありません)"))?;
+        Ok((row.file.clone(), row.line))
+    }
+
+    /// アドレス(16進文字列)に対応する(ファイル, 行番号)を求める。
+    /// 実行中はランタイムアドレス、未実行ならリンク時アドレスとして解釈する
+    /// (`break *<addr>` と同じ慣習)。
+    fn location_from_address(&self, hex: &str) -> Result<(PathBuf, u32)> {
+        let addr = parse_addr(hex)?;
+        let link_addr = if self.is_running() { addr.wrapping_sub(self.load_bias) } else { addr };
+        let row = self
+            .dwarf
+            .lookup(link_addr)
+            .ok_or_else(|| anyhow!("アドレス {:#x} に対応する行番号情報が見つかりません", addr))?;
+        Ok((row.file.clone(), row.line))
+    }
+
+    /// 関数名に対応する(ファイル, 行番号)を求める。ELF シンボルテーブルで
+    /// アドレスを引き、そのアドレスの行番号情報を DWARF から引く。
+    fn location_from_function(&self, name: &str) -> Result<(PathBuf, u32)> {
+        let sym = self.elf.find_by_name(name).ok_or_else(|| anyhow!("関数 '{}' が見つかりません", name))?;
+        let row = self
+            .dwarf
+            .lookup(sym.addr)
+            .ok_or_else(|| anyhow!("関数 '{}' の行番号情報が見つかりません(DWARF情報がありません)", name))?;
+        Ok((row.file.clone(), row.line))
+    }
+
+    /// 行番号情報の中から、ファイル名(フルパス・ファイル名部分・パスの
+    /// 末尾部分一致のいずれか)が `spec` に一致する最初のファイルパスを返す。
+    fn resolve_source_file(&self, spec: &str) -> Option<PathBuf> {
+        self.dwarf
+            .lines()
+            .iter()
+            .find(|r| {
+                !r.end_sequence
+                    && (r.file.to_string_lossy() == spec
+                        || r.file.file_name().and_then(|f| f.to_str()) == Some(spec)
+                        || r.file.to_string_lossy().ends_with(&format!("/{}", spec)))
+            })
+            .map(|r| r.file.clone())
+    }
+
+    /// `file` の `center_line` を中心とした前後計10行のソースを表示する
+    /// (GDB の `list` のデフォルト表示幅に合わせる)。
+    fn show_source_window(&self, file: &Path, center_line: u32) {
+        const WINDOW: u32 = 10;
+        let center_line = center_line.max(1);
+        let start = center_line.saturating_sub(WINDOW / 2 - 1).max(1);
+        let end = start + WINDOW - 1;
+        let Ok(content) = fs::read_to_string(file) else {
+            println!("ソースファイル '{}' を開けません", file.display());
+            return;
+        };
+        println!("{}:", file.display());
+        let mut any = false;
+        for (i, text) in content.lines().enumerate() {
+            let n = (i + 1) as u32;
+            if n < start {
+                continue;
+            }
+            if n > end {
+                break;
+            }
+            println!("{:>4}\t{}", n, text);
+            any = true;
+        }
+        if !any {
+            println!("(指定した行番号の範囲にソースがありません)");
+        }
+    }
+
     pub fn program_path(&self) -> &Path {
         &self.program
     }
@@ -1438,6 +1888,25 @@ impl Debugger {
     pub fn entry(&self) -> u64 {
         self.runtime_addr(self.elf.entry)
     }
+}
+
+/// `path` にある共有ライブラリの ELF を読み、`.dynsym` にある関数シンボル
+/// の名前 -> リンク時アドレス (`st_value`, ライブラリ自身のロードアドレス
+/// 0 からの相対値) の対応表を返す。メモリリーク追跡で malloc/free 等を
+/// libc から解決するのに使う。
+fn load_dynamic_symbols(path: &Path) -> Result<HashMap<String, u64>> {
+    let buf = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let elf = Elf::parse(&buf).context("failed to parse library ELF")?;
+    let mut map = HashMap::new();
+    for sym in elf.dynsyms.iter() {
+        if !sym.is_function() || sym.st_value == 0 {
+            continue;
+        }
+        if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+            map.entry(name.to_string()).or_insert(sym.st_value);
+        }
+    }
+    Ok(map)
 }
 
 fn read_source_line(path: &Path, line: u32) -> Option<String> {
