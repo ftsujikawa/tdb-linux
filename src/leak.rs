@@ -9,10 +9,24 @@ pub enum AllocFn {
     Free,
 }
 
+impl AllocFn {
+    /// `leaks` の一覧表示に使う関数名 (`malloc`/`calloc`/`realloc`)。
+    pub fn name(&self) -> &'static str {
+        match self {
+            AllocFn::Malloc => "malloc",
+            AllocFn::Calloc => "calloc",
+            AllocFn::Realloc => "realloc",
+            AllocFn::Free => "free",
+        }
+    }
+}
+
 /// 解放されずに残っている1つのヒープ確保。
 #[derive(Debug, Clone)]
 pub struct LiveAlloc {
     pub size: u64,
+    /// 確保に使われた関数 (`malloc`/`calloc`/`realloc`)。
+    pub func: AllocFn,
     /// 確保元の呼び出し位置(リンク時アドレス。`malloc` 等の戻りアドレス)。
     pub call_site: u64,
 }
@@ -50,6 +64,11 @@ pub struct LeakTracker {
     pub total_frees: u64,
     /// 追跡中の確保と対応しない free (二重解放・追跡外ポインタの可能性)。
     pub bad_frees: Vec<u64>,
+    /// libc 未マップ時のウォームアップ実行(実行ファイル自身のエントリ
+    /// ポイントまで内部的に進める処理)を既に試みたかどうか。1プロセスの
+    /// 実行につき1回だけ試みれば十分なので、失敗しても無限に再試行しない
+    /// ためのフラグ。
+    pub warmed_up: bool,
 }
 
 impl LeakTracker {
@@ -62,5 +81,6 @@ impl LeakTracker {
         self.total_allocs = 0;
         self.total_frees = 0;
         self.bad_frees.clear();
+        self.warmed_up = false;
     }
 }

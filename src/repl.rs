@@ -7,6 +7,7 @@ const HELP: &str = "\
 使用可能なコマンド:
   run, r                    プログラムを起動する
   break <func>, b <func>    関数名にブレークポイントを設定
+  break <ファイル>:<行番号>  ソースコードのファイル名:行番号にブレークポイントを設定(DWARF情報が必要)
   break *<addr>             アドレス(16進)にブレークポイントを設定
   info breakpoints, i b     ブレークポイント一覧を表示
   delete <n>, d <n>         ブレークポイント n を削除
@@ -93,7 +94,7 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
         "break" | "b" => match rest.first() {
             Some(spec) => dbg.break_at_spec(spec),
             None => {
-                println!("使い方: break <func> | break *<addr>");
+                println!("使い方: break <func> | break <ファイル>:<行番号> | break *<addr>");
                 Ok(())
             }
         },

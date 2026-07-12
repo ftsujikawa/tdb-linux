@@ -189,9 +189,9 @@ impl Debugger {
         }
 
         let pending: Vec<String> = self.pending_breaks.drain(..).collect();
-        for name in pending {
-            if let Err(e) = self.install_breakpoint_by_name(&name) {
-                eprintln!("警告: ブレークポイント '{}' の設置に失敗しました: {}", name, e);
+        for spec in pending {
+            if let Err(e) = self.install_breakpoint_by_spec(&spec) {
+                eprintln!("警告: ブレークポイント '{}' の設置に失敗しました: {}", spec, e);
             }
         }
 
@@ -236,8 +236,21 @@ impl Debugger {
         }
         if !self.is_running() {
             self.pending_breaks.push(spec.to_string());
-            println!("(未実行のため、'run' 実行時にシンボル '{}' を解決します)", spec);
+            println!("(未実行のため、'run' 実行時に '{}' を解決します)", spec);
             return Ok(());
+        }
+        self.install_breakpoint_by_spec(spec)
+    }
+
+    /// `関数名` または `ファイル名:行番号` のどちらかとして解釈しブレーク
+    /// ポイントを設置する。コロンを含み、コロンの右側が数値として解釈
+    /// できれば `ファイル名:行番号` として扱い、そうでなければ関数名として
+    /// 扱う。
+    fn install_breakpoint_by_spec(&mut self, spec: &str) -> Result<()> {
+        if let Some((file_part, line_part)) = spec.rsplit_once(':') {
+            if let Ok(line) = line_part.trim().parse::<u32>() {
+                return self.install_breakpoint_by_location(file_part.trim(), line);
+            }
         }
         self.install_breakpoint_by_name(spec)
     }
@@ -252,6 +265,43 @@ impl Debugger {
         let addr = self.skip_prologue_addr(&sym, entry_addr);
         self.install_breakpoint(addr, name.to_string());
         Ok(())
+    }
+
+    /// `ファイル名:行番号` にブレークポイントを設置する。指定行に実行可能な
+    /// コードが無い場合(空行・宣言のみの行等)は、同じファイル内で指定行
+    /// 以上の最小の行番号を持つ行に設置する(GDB と同様のフォールバック)。
+    fn install_breakpoint_by_location(&mut self, file_part: &str, line: u32) -> Result<()> {
+        let (link_addr, file, actual_line) = self.resolve_file_line(file_part, line)?;
+        let addr = self.runtime_addr(link_addr);
+        self.install_breakpoint(addr, format!("{}:{}", file.display(), actual_line));
+        Ok(())
+    }
+
+    /// `file_part`(フルパス・ファイル名・パスの末尾部分一致のいずれか、
+    /// `list` の `resolve_source_file` と同じ照合ルール)に一致するファイル
+    /// の行番号テーブルの中から、`line` 以上の最小の行番号を持つ行を探し、
+    /// そのリンク時アドレス・ファイルパス・実際の行番号を返す。
+    fn resolve_file_line(&self, file_part: &str, line: u32) -> Result<(u64, PathBuf, u32)> {
+        let mut candidates: Vec<&dwarf_info::LineRow> = self
+            .dwarf
+            .lines()
+            .iter()
+            .filter(|r| {
+                !r.end_sequence
+                    && r.is_stmt
+                    && (r.file.to_string_lossy() == file_part
+                        || r.file.file_name().and_then(|f| f.to_str()) == Some(file_part)
+                        || r.file.to_string_lossy().ends_with(&format!("/{}", file_part)))
+            })
+            .collect();
+        if candidates.is_empty() {
+            bail!("ファイル '{}' の行番号情報が見つかりません", file_part);
+        }
+        candidates.sort_by_key(|r| (r.line, r.addr));
+        let row = candidates.into_iter().find(|r| r.line >= line).ok_or_else(|| {
+            anyhow!("ファイル '{}' の {} 行目以降に実行可能なコードが見つかりません", file_part, line)
+        })?;
+        Ok((row.addr, row.file.clone(), row.line))
     }
 
     /// 関数シンボル `sym` (実行時エントリアドレス `entry_addr`) について、
@@ -813,12 +863,13 @@ impl Debugger {
             let total: u64 = items.iter().map(|(_, a)| a.size).sum();
             println!("未解放のヒープ確保: {} 件, 合計 {} バイト", items.len(), total);
             for (addr, alloc) in items {
+                let call_addr = self.runtime_addr(alloc.call_site);
                 let loc = self
                     .dwarf
                     .lookup(alloc.call_site)
                     .map(|row| format!("{}:{}", row.file.display(), row.line))
-                    .unwrap_or_else(|| format!("{:#x}", self.runtime_addr(alloc.call_site)));
-                println!("  {:#018x}  {:>8} バイト  確保元: {}", addr, alloc.size, loc);
+                    .unwrap_or_else(|| format!("{:#x}", call_addr));
+                println!("  {:#018x}  {:>8} バイト  確保元: {} ({})", addr, alloc.size, alloc.func.name(), loc);
             }
         }
         if !self.leak.bad_frees.is_empty() {
@@ -830,14 +881,29 @@ impl Debugger {
     }
 
     /// エントリブレークポイントが未解決であれば解決し、まだ設置していない
-    /// ものを設置する。`continue` のたびに呼ぶ(冪等)。libc がまだ
-    /// マップされていない(ロード直後で ld.so がまだ起動していない)場合は
-    /// 何もせず、次回の `continue` で再試行する。
+    /// ものを設置する。`continue` のたびに呼ぶ(冪等)。
+    ///
+    /// `run` 直後、ユーザーがまだ一度も停止していない状態(`break main` 等を
+    /// 経ていない)でいきなり `continue` した場合、この時点では ld.so が
+    /// まだ起動しておらず libc がプロセスにマップされていないため、通常の
+    /// 解決だけでは失敗する。その場合は実行ファイル自身のエントリポイント
+    /// (`_start`)まで内部的に(ユーザーに見えない形で)一度だけ実行を
+    /// 進めてから再解決する(`warm_up_to_own_entry` 参照)。1プロセスの
+    /// 実行につきこの試行は1回だけ行い(`leak.warmed_up`)、失敗しても
+    /// 無限に再試行はしない(例: malloc を全く使わない静的リンクバイナリ)。
     fn ensure_leak_breakpoints_installed(&mut self) {
         if self.leak.entries.is_empty() {
-            if let Err(e) = self.resolve_leak_entry_points() {
-                eprintln!("警告: メモリリーク追跡対象の関数解決に失敗しました: {}", e);
-                return;
+            let _ = self.resolve_leak_entry_points();
+        }
+        if self.leak.entries.is_empty() && !self.leak.warmed_up {
+            self.leak.warmed_up = true;
+            if matches!(self.find_libc_mapping(), Ok(None)) {
+                if let Err(e) = self.warm_up_to_own_entry() {
+                    eprintln!("警告: メモリリーク追跡の準備実行に失敗しました: {}", e);
+                }
+                if !self.exited {
+                    let _ = self.resolve_leak_entry_points();
+                }
             }
         }
         let Some(pid) = self.pid else { return };
@@ -850,6 +916,50 @@ impl Debugger {
                 }
             }
         }
+    }
+
+    /// libc がまだマップされていない場合に、実行ファイル自身のエントリ
+    /// ポイント(`_start`)まで一時ブレークポイント + `continue` で内部的に
+    /// 実行を進める。ld.so は依存する共有ライブラリ(libc を含む)の読み込みを
+    /// すべて終えてから実行ファイル自身のエントリに制御を渡すため、そこに
+    /// 到達すれば libc は必ずマップ済みになっている
+    /// (`finish_undebugged_frame` と同じ「一時ブレークポイントを置いて
+    /// 生の `waitpid` で待つ」パターン)。
+    fn warm_up_to_own_entry(&mut self) -> Result<()> {
+        let entry = self.entry();
+        let pid = self.pid()?;
+        let had_bp = self.breakpoints.contains_key(&entry);
+        if !had_bp {
+            let mut tmp = Breakpoint::new(entry);
+            tmp.enable(pid)?;
+            self.breakpoints.insert(entry, tmp);
+        }
+        ptrace::cont(pid, None)?;
+        match waitpid(pid, None)? {
+            WaitStatus::Exited(_, code) => {
+                self.mark_exited();
+                println!("[プロセスは終了しました (code={})]", code);
+            }
+            WaitStatus::Signaled(_, sig, _) => {
+                self.mark_exited();
+                println!("[プロセスはシグナル {} で終了しました]", sig);
+            }
+            WaitStatus::Stopped(_, Signal::SIGTRAP) => {
+                let mut regs = registers::get_regs(pid)?;
+                let hit_addr = regs.rip.wrapping_sub(1);
+                if self.breakpoints.contains_key(&hit_addr) {
+                    regs.rip = hit_addr;
+                    registers::set_regs(pid, &regs)?;
+                }
+            }
+            _ => {}
+        }
+        if !had_bp && !self.exited {
+            if let Some(mut bp) = self.breakpoints.remove(&entry) {
+                bp.disable(pid)?;
+            }
+        }
+        Ok(())
     }
 
     /// `ensure_leak_breakpoints_installed` で設置したブレークポイントを
@@ -1018,7 +1128,10 @@ impl Debugger {
         match pending.func {
             leak::AllocFn::Malloc | leak::AllocFn::Calloc => {
                 if ptr != 0 {
-                    self.leak.live.insert(ptr, leak::LiveAlloc { size: pending.size, call_site: pending.call_site });
+                    self.leak.live.insert(
+                        ptr,
+                        leak::LiveAlloc { size: pending.size, func: pending.func, call_site: pending.call_site },
+                    );
                     self.leak.total_allocs += 1;
                 }
             }
@@ -1027,7 +1140,10 @@ impl Debugger {
                     if pending.old_ptr != 0 {
                         self.leak.live.remove(&pending.old_ptr);
                     }
-                    self.leak.live.insert(ptr, leak::LiveAlloc { size: pending.size, call_site: pending.call_site });
+                    self.leak.live.insert(
+                        ptr,
+                        leak::LiveAlloc { size: pending.size, func: pending.func, call_site: pending.call_site },
+                    );
                     self.leak.total_allocs += 1;
                 } else if pending.size == 0 && pending.old_ptr != 0 {
                     // realloc(ptr, 0) は多くの実装で free 相当として扱われる。
