@@ -17,6 +17,8 @@ const HELP: &str = "\
   next, n                   ソース行単位でステップオーバー実行する(DWARF情報が必要)
   up                        現在の関数の呼び出し元へ戻るまで実行する
   backtrace, bt             コールスタックを表示する
+  syms [絞り込み文字列]      ELFのシンボル(関数)一覧を表示する
+  lines [関数名]             行番号情報(アドレス・ファイル・行番号)を表示する(DWARF情報が必要)
   info registers, i r       レジスタを表示する
   print <式>, p <式>        式を評価して表示する (例: p $rax, p x+1, p *$rsp, p &x, p ptr->field)
   print/fmt <式>            フォーマット指定して表示する (fmt: x=16進 o=8進
@@ -109,6 +111,14 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
         "next" | "n" => dbg.next_line(),
         "up" => dbg.up(),
         "backtrace" | "bt" => dbg.backtrace(),
+        "syms" => {
+            dbg.list_symbols(rest.first().copied());
+            Ok(())
+        }
+        "lines" => {
+            dbg.list_lines(rest.first().copied());
+            Ok(())
+        }
         "print" | "p" => handle_print(dbg, None, &rest),
         other if other.starts_with("print/") => handle_print(dbg, Some(&other["print/".len()..]), &rest),
         other if other.starts_with("p/") => handle_print(dbg, Some(&other["p/".len()..]), &rest),

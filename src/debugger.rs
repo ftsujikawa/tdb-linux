@@ -1275,6 +1275,48 @@ impl Debugger {
         Ok(())
     }
 
+    /// ELF のシンボルテーブル (関数シンボル) を一覧表示する (`syms` コマンド)。
+    /// `filter` が指定されていれば、シンボル名にその文字列を含むものだけ
+    /// 表示する。プロセス実行中はロードバイアスを加えた実行時アドレスを、
+    /// 未実行なら ELF 上のリンク時アドレスをそのまま表示する。
+    pub fn list_symbols(&self, filter: Option<&str>) {
+        let symbols: Vec<&Symbol> =
+            self.elf.symbols.iter().filter(|s| filter.is_none_or(|f| s.name.contains(f))).collect();
+        if symbols.is_empty() {
+            println!("シンボルが見つかりません");
+            return;
+        }
+        for s in symbols {
+            let addr = if self.is_running() { self.runtime_addr(s.addr) } else { s.addr };
+            println!("{:#018x} {:>6} {}", addr, s.size, s.name);
+        }
+    }
+
+    /// `.debug_line` の行番号情報を一覧表示する (`lines` コマンド)。`filter`
+    /// が関数名として解決できれば、その関数のアドレス範囲内の行だけに
+    /// 絞り込む(解決できなければ絞り込まず全件表示する)。終端マーカー
+    /// (`end_sequence`)の行は実際のソース行ではないため表示しない。
+    pub fn list_lines(&self, filter: Option<&str>) {
+        let range = filter.and_then(|name| self.elf.find_by_name(name)).map(|s| (s.addr, s.addr + s.size.max(1)));
+        let mut any = false;
+        for row in self.dwarf.lines() {
+            if row.end_sequence {
+                continue;
+            }
+            if let Some((lo, hi)) = range {
+                if row.addr < lo || row.addr >= hi {
+                    continue;
+                }
+            }
+            any = true;
+            let addr = if self.is_running() { self.runtime_addr(row.addr) } else { row.addr };
+            println!("{:#018x} {}:{}", addr, row.file.display(), row.line);
+        }
+        if !any {
+            println!("行番号情報が見つかりません(DWARF情報が無いか、指定した関数が見つかりません)");
+        }
+    }
+
     pub fn program_path(&self) -> &Path {
         &self.program
     }

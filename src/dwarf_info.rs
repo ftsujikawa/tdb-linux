@@ -241,6 +241,12 @@ impl DwarfInfo {
     pub fn globals(&self) -> &[VarInfo] {
         &self.globals
     }
+
+    /// `.debug_line` の行テーブル(アドレス昇順、`end_sequence` 行も含む)。
+    /// `lines` コマンドで使う。
+    pub fn lines(&self) -> &[LineRow] {
+        &self.rows
+    }
 }
 
 /// SLEB128 (符号付き可変長整数) をデコードする。DWARF 式のオペランド解析に使う。
