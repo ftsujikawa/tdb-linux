@@ -25,13 +25,15 @@ const HELP: &str = "\
   list <行番号>              現在位置(または main)と同じファイルのその行を中心に表示する
   list <ファイル>:<行番号>    指定ファイルのその行を中心に表示する(DWARF情報が必要)
   list *<addr>              アドレス(16進、実行中はランタイムアドレス)に対応する行を表示する
-  info registers, i r       レジスタを表示する
+  info registers, i r       全レジスタを表示する(汎用・rip・eflags・orig_rax・セグメント・
+                              fs_base/gs_base・x87 st0-st7・SSE xmm0-xmm15・mxcsr)
   print <式>, p <式>        式を評価して表示する (例: p $rax, p x+1, p *$rsp,
                               p &x, p ptr->field, p ptr.field, p arr, p arr[0],
                               p arr[0]->x)
   print/fmt <式>            フォーマット指定して表示する (fmt: x=16進 o=8進
                               t=2進 d/i=10進 c=文字 s=文字列, 例: p/x $rax)
-  set $<reg>=<式>           レジスタに式の評価値を設定する
+  set $<reg>=<式>           レジスタに式の評価値を設定する(st0-st7は浮動小数点数として、
+                              xmm0-xmm15は下位64bit整数として扱う)
   set <変数名>=<式>         ローカル変数/仮引数に式の評価値を設定する(DWARF情報が必要)
   set <変数名>-><メンバ>=<式>  構造体メンバに式の評価値を設定する(->と.は同じ意味、DWARF情報が必要)
   set <変数名>[<添字>]=<式>    配列/ポインタの要素に式の評価値を設定する(DWARF情報が必要)
@@ -369,7 +371,7 @@ fn handle_set(dbg: &mut Debugger, first_tok: &str, rest_toks: &[&str]) -> anyhow
     }
 
     if let Some(reg_name) = target.strip_prefix('$') {
-        return dbg.set_reg(reg_name, value.as_i64() as u64);
+        return dbg.set_reg(reg_name, value);
     }
 
     if let Some((base, steps)) = expr::parse_pure_chain(target, dbg)? {

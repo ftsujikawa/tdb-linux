@@ -1216,19 +1216,52 @@ impl Debugger {
         let pid = self.pid()?;
         let regs = registers::get_regs(pid)?;
         println!("{}", registers::dump(&regs));
+        match registers::get_fpregs(pid) {
+            Ok(fpregs) => println!("{}", registers::dump_fpregs(&fpregs)),
+            Err(e) => eprintln!("警告: 浮動小数点レジスタの取得に失敗しました: {}", e),
+        }
         Ok(())
     }
 
+    /// `$<レジスタ名>` の値を取得する。`st0`-`st7`/`xmm0`-`xmm15` は
+    /// `set_reg` の下位64bit書き込みに対応する下位64bitを返す(80bit
+    /// 拡張精度としての小数値は `info registers` の `value=` を参照)。
     pub fn get_reg(&self, name: &str) -> Result<u64> {
         let pid = self.pid()?;
+        if let Some(idx) = registers::parse_st_name(name) {
+            let fpregs = registers::get_fpregs(pid)?;
+            return Ok(registers::st_low64(&fpregs, idx));
+        }
+        if let Some(idx) = registers::parse_xmm_name(name) {
+            let fpregs = registers::get_fpregs(pid)?;
+            return Ok(registers::xmm_low64(&fpregs, idx));
+        }
         let regs = registers::get_regs(pid)?;
         registers::get_by_name(&regs, name).ok_or_else(|| anyhow!("不明なレジスタ: {}", name))
     }
 
-    pub fn set_reg(&self, name: &str, val: u64) -> Result<()> {
+    /// `$<レジスタ名>` への `set` を行う。`st0`-`st7`/`xmm0`-`xmm15` は
+    /// `user_regs_struct` に無いため、`PTRACE_GETFPREGS`/`SETFPREGS` 相当の
+    /// 別経路で扱う。`st` レジスタは浮動小数点数として意味のある唯一の型
+    /// なので、式の値を `f64` として解釈し80bit拡張精度へ変換する
+    /// (`print $stN` / `info registers` の表示と対応する)。`xmm` レジスタは
+    /// 128bit全体の解釈が用途で変わるため、他の整数レジスタと同様に式の値を
+    /// 整数として扱い、下位64bitへ書き込む(上位64bitは0にする)。
+    pub fn set_reg(&self, name: &str, value: expr::Value) -> Result<()> {
         let pid = self.pid()?;
+        if let Some(idx) = registers::parse_st_name(name) {
+            let mut fpregs = registers::get_fpregs(pid)?;
+            let bytes = registers::encode_x87_extended(value.as_f64());
+            registers::set_st_bytes(&mut fpregs, idx, &bytes);
+            return registers::set_fpregs(pid, &fpregs);
+        }
+        if let Some(idx) = registers::parse_xmm_name(name) {
+            let mut fpregs = registers::get_fpregs(pid)?;
+            registers::set_xmm_low64(&mut fpregs, idx, value.as_i64() as u64);
+            return registers::set_fpregs(pid, &fpregs);
+        }
         let mut regs = registers::get_regs(pid)?;
-        if !registers::set_by_name(&mut regs, name, val) {
+        if !registers::set_by_name(&mut regs, name, value.as_i64() as u64) {
             bail!("不明なレジスタ: {}", name);
         }
         registers::set_regs(pid, &regs)
