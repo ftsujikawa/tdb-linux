@@ -2,9 +2,30 @@ use anyhow::Result;
 use nix::sys::ptrace;
 use nix::sys::ptrace::regset::NT_PRFPREG;
 use nix::unistd::Pid;
+use std::ffi::c_void;
+use std::mem::offset_of;
 
 pub type Regs = libc::user_regs_struct;
 pub type FpRegs = libc::user_fpregs_struct;
+
+/// `struct user` (`PTRACE_PEEKUSER`/`PTRACE_POKEUSER` が参照する領域) 内の
+/// `u_debugreg` (DR0-DR7) フィールドのバイトオフセット。ウォッチポイント
+/// (`watch` コマンド) の実装に使う。
+const DEBUGREG_OFFSET: usize = offset_of!(libc::user, u_debugreg);
+
+/// デバッグレジスタ DR`i` (0-7) を読む (`PTRACE_PEEKUSER` 相当)。
+/// DR0-DR3 はウォッチポイントのアドレス、DR6 はステータス、DR7 は制御用。
+pub fn read_dr(pid: Pid, i: usize) -> Result<u64> {
+    let offset = (DEBUGREG_OFFSET + i * 8) as *mut c_void;
+    Ok(ptrace::read_user(pid, offset)? as u64)
+}
+
+/// デバッグレジスタ DR`i` (0-7) に書き込む (`PTRACE_POKEUSER` 相当)。
+pub fn write_dr(pid: Pid, i: usize, val: u64) -> Result<()> {
+    let offset = (DEBUGREG_OFFSET + i * 8) as *mut c_void;
+    ptrace::write_user(pid, offset, val as i64)?;
+    Ok(())
+}
 
 pub fn get_regs(pid: Pid) -> Result<Regs> {
     Ok(ptrace::getregs(pid)?)

@@ -75,6 +75,27 @@ pub struct Debugger {
     /// ブレークポイントが偶然同じアドレスになった場合に、追跡側が
     /// 勝手に実行を継続してしまわないようにするために参照する。
     skip_target: Option<u64>,
+    /// ハードウェアウォッチポイント (`watch` コマンド)。x86-64 のデバッグ
+    /// レジスタ DR0-DR3 に対応するため最大4つ。`None` は未使用スロット。
+    /// プロセスの再起動 (`run`) では引き継がない(`break *addr` と同様)。
+    watchpoints: [Option<Watchpoint>; 4],
+    /// ウォッチポイントID -> DRスロット番号 (0-3)。`bp_ids`/`next_bp_id` と
+    /// 番号を共有する(GDBと同様、ブレークポイントとウォッチポイントを
+    /// 同じ通し番号で管理する)。
+    wp_ids: HashMap<u32, usize>,
+}
+
+/// ハードウェアウォッチポイント1つ分の情報。
+struct Watchpoint {
+    /// 監視するメモリアドレス(実行時アドレス)。
+    addr: u64,
+    /// 監視する幅 (1/2/4/8バイトのいずれか)。
+    len: u8,
+    /// 表示用ラベル(変数名 または `*addr`)。
+    label: String,
+    /// 直前に観測した値。トリガー時の「旧値」として使い、その後は新しい
+    /// 値で更新する。
+    last_value: u64,
 }
 
 /// `step`/`next` の1回の実行(単一命令の実行、または call をまたぐ実行)の
@@ -84,6 +105,8 @@ enum StepStop {
     Signaled,
     /// ブレークポイントで停止 (rip は既にブレークポイントアドレスへ補正済み)。
     Breakpoint(u64),
+    /// ハードウェアウォッチポイントで停止(報告メッセージを含む)。
+    Watchpoint(String),
     /// ブレークポイント以外の理由で停止した際の rip。
     Other(u64),
     Unexpected,
@@ -109,6 +132,8 @@ impl Debugger {
             print_elements: Some(200),
             leak: LeakTracker::default(),
             skip_target: None,
+            watchpoints: [None, None, None, None],
+            wp_ids: HashMap::new(),
         })
     }
 
@@ -155,6 +180,8 @@ impl Debugger {
         self.bp_ids.clear();
         self.exited = false;
         self.leak.reset_for_run();
+        self.watchpoints = [None, None, None, None];
+        self.wp_ids.clear();
 
         let path = CString::new(self.program.as_os_str().to_str().unwrap())?;
         let mut c_args: Vec<CString> = vec![path.clone()];
@@ -377,7 +404,13 @@ impl Debugger {
         }
     }
 
+    /// ブレークポイント `id` を削除する。`id` がウォッチポイントのもので
+    /// あれば、`delete_watchpoint` に委ねる(GDB と同様、`delete` はどちらの
+    /// 種類の番号も受け付ける)。
     pub fn delete_breakpoint(&mut self, id: u32) -> Result<()> {
+        if self.wp_ids.contains_key(&id) {
+            return self.delete_watchpoint(id);
+        }
         let addr = self
             .bp_ids
             .remove(&id)
@@ -393,9 +426,168 @@ impl Debugger {
         Ok(())
     }
 
+    // ---- ウォッチポイント ----
+
+    /// 変数名を解決してアドレスとサイズ(バイト数)を返す。まず現在の PC
+    /// のスコープのローカル変数/仮引数を探し、無ければグローバル変数を探す
+    /// (`show globals` と同じ探索)。`watch <変数名>` から使う。
+    pub fn variable_address_and_size(&self, name: &str) -> Result<(u64, u64)> {
+        if let Ok((addr, var)) = self.resolve_variable(name) {
+            return Ok((addr, var.ty.byte_size()));
+        }
+        let pid = self.pid()?;
+        let regs = registers::get_regs(pid)?;
+        let var = self
+            .dwarf
+            .globals()
+            .iter()
+            .find(|v| v.name == name)
+            .ok_or_else(|| anyhow!("変数 '{}' が見つかりません(現在のスコープ外か、デバッグ情報がありません)", name))?;
+        let addr = self.eval_location(&var.location, 0, &regs)?;
+        Ok((addr, var.ty.byte_size()))
+    }
+
+    /// ハードウェアウォッチポイントを設置する (`watch` コマンド)。`addr` は
+    /// `len` (1/2/4/8) バイト境界に整列している必要がある(x86-64 のデバッグ
+    /// レジスタの制約)。DR0-DR3 の空きスロットを探して使うため、最大4つまで。
+    pub fn add_watchpoint(&mut self, addr: u64, len: u8, label: String) -> Result<()> {
+        if ![1u8, 2, 4, 8].contains(&len) {
+            bail!("ウォッチポイントのサイズは1/2/4/8バイトのいずれかである必要があります");
+        }
+        if addr % len as u64 != 0 {
+            bail!("ウォッチポイントのアドレス {:#x} は {} バイト境界に整列していません", addr, len);
+        }
+        let pid = self.pid()?;
+        let slot = self
+            .watchpoints
+            .iter()
+            .position(|w| w.is_none())
+            .ok_or_else(|| anyhow!("ウォッチポイントは(ハードウェアの制約により)最大4つまでです"))?;
+
+        let bytes = self.read_mem(addr, len as usize)?;
+        let last_value = bytes_to_u64(&bytes);
+        self.install_watch_slot(pid, slot, addr, len)?;
+
+        let id = self.next_bp_id;
+        self.next_bp_id += 1;
+        self.wp_ids.insert(id, slot);
+        self.watchpoints[slot] = Some(Watchpoint { addr, len, label: label.clone(), last_value });
+        println!("ウォッチポイント {} を {} ({:#x}, {}バイト) に設定しました", id, label, addr, len);
+        Ok(())
+    }
+
+    pub fn list_watchpoints(&self) {
+        if self.wp_ids.is_empty() {
+            println!("ウォッチポイントは設定されていません");
+            return;
+        }
+        let mut items: Vec<(&u32, &usize)> = self.wp_ids.iter().collect();
+        items.sort_by_key(|(id, _)| **id);
+        for (id, &slot) in items {
+            if let Some(wp) = &self.watchpoints[slot] {
+                println!(
+                    "{}: {} ({:#x}, {}バイト)  現在値 = {:#x}",
+                    id, wp.label, wp.addr, wp.len, wp.last_value
+                );
+            }
+        }
+    }
+
+    fn delete_watchpoint(&mut self, id: u32) -> Result<()> {
+        let slot = self.wp_ids.remove(&id).ok_or_else(|| anyhow!("ウォッチポイント {} は存在しません", id))?;
+        self.watchpoints[slot] = None;
+        if let Some(pid) = self.pid {
+            if !self.exited {
+                self.uninstall_watch_slot(pid, slot)?;
+            }
+        }
+        println!("ウォッチポイント {} を削除しました", id);
+        Ok(())
+    }
+
+    /// x86-64 の DR7 (デバッグ制御レジスタ) における `len` フィールドの符号化。
+    fn dr7_len_bits(len: u8) -> u64 {
+        match len {
+            1 => 0b00,
+            2 => 0b01,
+            8 => 0b10,
+            4 => 0b11,
+            _ => unreachable!("呼び出し元 (add_watchpoint) でサイズを検証済み"),
+        }
+    }
+
+    /// DR`slot` にアドレスを設定し、DR7 で有効化する(R/Wフィールドは書き込み
+    /// 監視の `01` 固定)。
+    fn install_watch_slot(&self, pid: Pid, slot: usize, addr: u64, len: u8) -> Result<()> {
+        registers::write_dr(pid, slot, addr)?;
+        let mut dr7 = registers::read_dr(pid, 7)?;
+        const RW_WRITE: u64 = 0b01;
+        let field_shift = 16 + slot * 4;
+        dr7 &= !(0b1111u64 << field_shift);
+        dr7 |= (RW_WRITE | (Self::dr7_len_bits(len) << 2)) << field_shift;
+        dr7 |= 1 << (slot * 2); // L{slot}: ローカル有効化
+        registers::write_dr(pid, 7, dr7)?;
+        Ok(())
+    }
+
+    /// DR7 の該当スロットのローカル有効化ビットを落として無効化する。
+    fn uninstall_watch_slot(&self, pid: Pid, slot: usize) -> Result<()> {
+        let mut dr7 = registers::read_dr(pid, 7)?;
+        dr7 &= !(1 << (slot * 2));
+        registers::write_dr(pid, 7, dr7)?;
+        registers::write_dr(pid, slot, 0)?;
+        Ok(())
+    }
+
+    /// 直近の SIGTRAP がハードウェアウォッチポイントによるものかを DR6 で
+    /// 調べる。該当すれば(旧値・新値を含む)報告メッセージを組み立てて
+    /// 返し、`last_value` を更新したうえで DR6 をクリアする
+    /// (古いステータスが次回の判定に残らないようにするため)。
+    /// ウォッチポイントでなければ `None`(呼び出し元は通常の SIGTRAP 処理を
+    /// 続ける)。
+    fn check_watchpoint_hit(&mut self) -> Result<Option<String>> {
+        let pid = self.pid()?;
+        let dr6 = registers::read_dr(pid, 6)?;
+        if dr6 & 0b1111 == 0 {
+            return Ok(None);
+        }
+        let mut messages = Vec::new();
+        for slot in 0..4 {
+            if dr6 & (1 << slot) == 0 {
+                continue;
+            }
+            let id = self.wp_ids.iter().find_map(|(&id, &s)| (s == slot).then_some(id));
+            let Some(id) = id else { continue };
+            let Some((addr, len, label, old_value)) =
+                self.watchpoints[slot].as_ref().map(|wp| (wp.addr, wp.len, wp.label.clone(), wp.last_value))
+            else {
+                continue;
+            };
+            let bytes = self.read_mem(addr, len as usize)?;
+            let new_value = bytes_to_u64(&bytes);
+            if let Some(wp) = self.watchpoints[slot].as_mut() {
+                wp.last_value = new_value;
+            }
+            messages.push(format!(
+                "ウォッチポイント {} がトリガーされました: {} ({:#x})\n  旧値 = {:#x}\n  新値 = {:#x}",
+                id, label, addr, old_value, new_value
+            ));
+        }
+        registers::write_dr(pid, 6, 0)?;
+        Ok(if messages.is_empty() { None } else { Some(messages.join("\n")) })
+    }
+
     // ---- 実行制御 ----
 
-    fn step_over_current_breakpoint(&mut self) -> Result<()> {
+    /// 現在の `rip` に有効なブレークポイントがあれば、それを一時的に元の
+    /// バイトへ戻して1命令だけ実行し、書き戻す。この1命令の実行中に
+    /// ハードウェアウォッチポイントが発火することがある(例えば
+    /// ブレークポイントの直後の命令がちょうど監視対象への書き込みだった
+    /// 場合)。その場合の報告メッセージを `Some` で返すので、呼び出し元は
+    /// それをそのまま停止として報告し、本来予定していた `continue`/`step`
+    /// は行わないこと(この戻り値を見ずに単に `?` だけで捨てると、
+    /// ウォッチポイントのヒットを見逃してしまう)。
+    fn step_over_current_breakpoint(&mut self) -> Result<Option<String>> {
         let pid = self.pid()?;
         let regs = registers::get_regs(pid)?;
         if let Some(bp) = self.breakpoints.get_mut(&regs.rip) {
@@ -406,7 +598,15 @@ impl Debugger {
                     WaitStatus::Exited(_, code) => {
                         self.mark_exited();
                         println!("[プロセスは終了しました (code={})]", code);
-                        return Ok(());
+                        return Ok(None);
+                    }
+                    WaitStatus::Stopped(_, Signal::SIGTRAP) => {
+                        if let Some(msg) = self.check_watchpoint_hit()? {
+                            if let Some(bp) = self.breakpoints.get_mut(&regs.rip) {
+                                bp.enable(pid)?;
+                            }
+                            return Ok(Some(msg));
+                        }
                     }
                     _ => {}
                 }
@@ -415,12 +615,24 @@ impl Debugger {
                 }
             }
         }
+        Ok(None)
+    }
+
+    /// ウォッチポイントのトリガー報告メッセージを表示し、現在の停止位置
+    /// (ソース行/逆アセンブル)も続けて表示する。
+    fn report_watchpoint(&mut self, msg: String) -> Result<()> {
+        println!("{}", msg);
+        let pid = self.pid()?;
+        let regs = registers::get_regs(pid)?;
+        self.show_stop_location(regs.rip);
         Ok(())
     }
 
     pub fn cont(&mut self) -> Result<()> {
         self.pid()?;
-        self.step_over_current_breakpoint()?;
+        if let Some(msg) = self.step_over_current_breakpoint()? {
+            return self.report_watchpoint(msg);
+        }
         if self.exited {
             return Ok(());
         }
@@ -438,7 +650,9 @@ impl Debugger {
 
     pub fn stepi(&mut self) -> Result<()> {
         self.pid()?;
-        self.step_over_current_breakpoint()?;
+        if let Some(msg) = self.step_over_current_breakpoint()? {
+            return self.report_watchpoint(msg);
+        }
         if self.exited {
             return Ok(());
         }
@@ -525,6 +739,9 @@ impl Debugger {
                 Ok(StepStop::Signaled)
             }
             WaitStatus::Stopped(_, Signal::SIGTRAP) => {
+                if let Some(msg) = self.check_watchpoint_hit()? {
+                    return Ok(StepStop::Watchpoint(msg));
+                }
                 let pid = self.pid()?;
                 let mut regs = registers::get_regs(pid)?;
                 let bp_addr = regs.rip.wrapping_sub(1);
@@ -572,6 +789,13 @@ impl Debugger {
                     let sym = self.symbol_at(addr);
                     println!("ブレークポイントで停止: {:#x} <{}>", addr, sym);
                     self.show_stop_location(addr);
+                    return Ok(());
+                }
+                StepStop::Watchpoint(msg) => {
+                    println!("{}", msg);
+                    let pid = self.pid()?;
+                    let regs = registers::get_regs(pid)?;
+                    self.show_stop_location(regs.rip);
                     return Ok(());
                 }
                 StepStop::Other(rip) => {
@@ -644,6 +868,13 @@ impl Debugger {
                     self.show_stop_location(addr);
                     return Ok(());
                 }
+                StepStop::Watchpoint(msg) => {
+                    println!("{}", msg);
+                    let pid = self.pid()?;
+                    let regs = registers::get_regs(pid)?;
+                    self.show_stop_location(regs.rip);
+                    return Ok(());
+                }
                 StepStop::Other(rip) => {
                     let link_ip = rip.wrapping_sub(self.load_bias);
                     match self.dwarf.lookup(link_ip) {
@@ -683,7 +914,10 @@ impl Debugger {
             tmp.enable(pid)?;
             self.breakpoints.insert(ret_addr, tmp);
         }
-        self.step_over_current_breakpoint()?;
+        if let Some(msg) = self.step_over_current_breakpoint()? {
+            self.report_watchpoint(msg)?;
+            return Ok(None);
+        }
         if self.exited {
             return Ok(None);
         }
@@ -787,13 +1021,18 @@ impl Debugger {
                     return Ok(());
                 }
                 WaitStatus::Stopped(_, Signal::SIGTRAP) => {
+                    if let Some(msg) = self.check_watchpoint_hit()? {
+                        return self.report_watchpoint(msg);
+                    }
                     let mut regs = registers::get_regs(pid)?;
                     let bp_addr = regs.rip.wrapping_sub(1);
                     if self.breakpoints.contains_key(&bp_addr) {
                         regs.rip = bp_addr;
                         registers::set_regs(pid, &regs)?;
                         if self.leak.enabled && self.handle_leak_breakpoint(bp_addr)? {
-                            self.step_over_current_breakpoint()?;
+                            if let Some(msg) = self.step_over_current_breakpoint()? {
+                                return self.report_watchpoint(msg);
+                            }
                             if self.exited {
                                 return Ok(());
                             }
@@ -2070,6 +2309,14 @@ fn parse_addr(s: &str) -> Result<u64> {
     let s = s.trim();
     let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
     u64::from_str_radix(s, 16).context("アドレスの解析に失敗しました (16進数を指定してください)")
+}
+
+/// 1/2/4/8バイトの生バイト列(リトルエンディアン)を `u64` へゼロ拡張する。
+/// ウォッチポイントの値表示(`watch`/`check_watchpoint_hit`)に使う。
+fn bytes_to_u64(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    u64::from_ne_bytes(buf)
 }
 
 /// 先頭が call 命令であればその命令長を返す。

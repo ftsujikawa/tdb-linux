@@ -10,7 +10,10 @@ const HELP: &str = "\
   break <ファイル>:<行番号>  ソースコードのファイル名:行番号にブレークポイントを設定(DWARF情報が必要)
   break *<addr>             アドレス(16進)にブレークポイントを設定
   info breakpoints, i b     ブレークポイント一覧を表示
-  delete <n>, d <n>         ブレークポイント n を削除
+  watch <変数名>             変数への書き込みでハードウェアウォッチポイントを設定(DWARF情報が必要)
+  watch *<addr式> [長さ]     アドレスへの書き込みでウォッチポイントを設定(長さ省略時8バイト)
+  info watchpoints, i w     ウォッチポイント一覧を表示
+  delete <n>, d <n>         ブレークポイント/ウォッチポイント n を削除
   continue, c               実行を再開する
   stepi, si                 機械語命令を1つ実行する
   nexti, ni                 call をまたいで機械語命令を1つ実行する
@@ -105,16 +108,21 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
                 dbg.list_breakpoints();
                 Ok(())
             }
+            Some("watchpoints") | Some("w") => {
+                dbg.list_watchpoints();
+                Ok(())
+            }
             Some("registers") | Some("r") => dbg.print_regs(),
             _ => {
-                println!("使い方: info breakpoints | info registers");
+                println!("使い方: info breakpoints | info watchpoints | info registers");
                 Ok(())
             }
         },
+        "watch" => handle_watch(dbg, &rest),
         "delete" | "d" => match rest.first().and_then(|s| s.parse::<u32>().ok()) {
             Some(id) => dbg.delete_breakpoint(id),
             None => {
-                println!("使い方: delete <番号>");
+                println!("使い方: delete <番号> (ブレークポイント/ウォッチポイント共通の番号)");
                 Ok(())
             }
         },
@@ -381,6 +389,26 @@ fn handle_set(dbg: &mut Debugger, first_tok: &str, rest_toks: &[&str]) -> anyhow
     }
 
     dbg.write_variable(target, value)
+}
+
+/// `watch <変数名>` は変数のアドレス・型サイズを DWARF 情報から解決し、
+/// `watch *<addr式> [長さ]` は式を評価してアドレスを求める(長さ省略時は
+/// 8バイト)。どちらもハードウェアウォッチポイント(書き込み監視、
+/// 1/2/4/8バイトのいずれか)として設置する。
+fn handle_watch(dbg: &mut Debugger, rest: &[&str]) -> anyhow::Result<()> {
+    let target = rest
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("使い方: watch <変数名> | watch *<addr式> [長さ(1/2/4/8, 既定8)]"))?;
+    if let Some(addr_expr) = target.strip_prefix('*') {
+        let addr = expr::eval(addr_expr, dbg)?.as_i64() as u64;
+        let len: u8 = match rest.get(1) {
+            Some(s) => s.parse().map_err(|_| anyhow::anyhow!("長さの解析に失敗しました: '{}'", s))?,
+            None => 8,
+        };
+        return dbg.add_watchpoint(addr, len, format!("*{:#x}", addr));
+    }
+    let (addr, size) = dbg.variable_address_and_size(target)?;
+    dbg.add_watchpoint(addr, size as u8, target.to_string())
 }
 
 fn handle_examine(dbg: &Debugger, cmd: &str, rest: &[&str]) -> anyhow::Result<()> {
