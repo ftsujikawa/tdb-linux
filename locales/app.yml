@@ -1,0 +1,472 @@
+_version: 2
+
+help:
+  ja: |
+    使用可能なコマンド:
+      run, r                    プログラムを起動する
+      break <func>, b <func>    関数名にブレークポイントを設定
+      break <ファイル>:<行番号>  ソースコードのファイル名:行番号にブレークポイントを設定(DWARF情報が必要)
+      break *<addr>             アドレス(16進)にブレークポイントを設定
+      info breakpoints, i b     ブレークポイント一覧を表示
+      watch <変数名>             変数への書き込みでハードウェアウォッチポイントを設定(DWARF情報が必要)
+      watch *<addr式> [長さ]     アドレスへの書き込みでウォッチポイントを設定(長さ省略時8バイト)
+      info watchpoints, i w     ウォッチポイント一覧を表示
+      delete <n>, d <n>         ブレークポイント/ウォッチポイント n を削除
+      continue, c               実行を再開する
+      stepi, si                 機械語命令を1つ実行する
+      nexti, ni                 call をまたいで機械語命令を1つ実行する
+      step, s                   ソース行単位でステップイン実行する(DWARF情報が必要)
+      next, n                   ソース行単位でステップオーバー実行する(DWARF情報が必要)
+      up                        現在の関数の呼び出し元へ戻るまで実行する
+      backtrace, bt             コールスタックを表示する
+      syms [絞り込み文字列]      ELFのシンボル(関数)一覧を表示する
+      lines [関数名]             行番号情報(アドレス・ファイル・行番号)を表示する(DWARF情報が必要)
+      list, l                   ソースコードを表示する(現在位置、無ければ main を中心に10行)
+      list <関数名>              その関数の先頭を中心にソースコードを表示する(DWARF情報が必要)
+      list <行番号>              現在位置(または main)と同じファイルのその行を中心に表示する
+      list <ファイル>:<行番号>    指定ファイルのその行を中心に表示する(DWARF情報が必要)
+      list *<addr>              アドレス(16進、実行中はランタイムアドレス)に対応する行を表示する
+      info registers, i r       全レジスタを表示する(汎用・rip・eflags・orig_rax・セグメント・
+                                  fs_base/gs_base・x87 st0-st7・SSE xmm0-xmm15・mxcsr)
+      print <式>, p <式>        式を評価して表示する (例: p $rax, p x+1, p *$rsp,
+                                  p &x, p ptr->field, p ptr.field, p arr, p arr[0],
+                                  p arr[0]->x)
+      print/fmt <式>            フォーマット指定して表示する (fmt: x=16進 o=8進
+                                  t=2進 d/i=10進 c=文字 s=文字列, 例: p/x $rax)
+      set $<reg>=<式>           レジスタに式の評価値を設定する(st0-st7は浮動小数点数として、
+                                  xmm0-xmm15は下位64bit整数として扱う)
+      set <変数名>=<式>         ローカル変数/仮引数に式の評価値を設定する(DWARF情報が必要)
+      set <変数名>-><メンバ>=<式>  構造体メンバに式の評価値を設定する(->と.は同じ意味、DWARF情報が必要)
+      set <変数名>[<添字>]=<式>    配列/ポインタの要素に式の評価値を設定する(DWARF情報が必要)
+      set print pretty on|off   構造体を複数行インデント表示するか(既定 off)
+      set print elements <n>|unlimited
+                                文字列(/s)/構造体表示の要素数上限(既定 200)
+      show print                現在の print pretty/elements 設定を表示する
+      show locals               現在の関数のローカル変数一覧を表示する(DWARF情報が必要)
+      show args                 現在の関数の仮引数一覧を表示する(DWARF情報が必要)
+      show globals               グローバル変数の一覧を表示する(DWARF情報が必要)
+      x/<n> <addr>              メモリをバイト列として表示する
+      set *<addr式>=<式>        メモリを1バイト書き換える (例: set *0x4011a0=0x90)
+      leak on|off               メモリリーク追跡(malloc/calloc/realloc/free)を有効/無効化する
+      leak                      メモリリーク追跡の状態(on/off・確保/解放回数)を表示する
+      leaks                     未解放のヒープ確保一覧を表示する(leak on かつ continue 実行が必要)
+      lang <en|ja>              表示言語を切り替える(今のところ、このヘルプの表示のみに影響)
+      kill, k                   実行中のプロセスを終了する
+      help, h, ?                このヘルプを表示する
+      quit, q                   デバッガを終了する
+  en: |
+    Available commands:
+      run, r                    Start the program
+      break <func>, b <func>    Set a breakpoint at a function
+      break <file>:<line>       Set a breakpoint at a source file:line (requires DWARF info)
+      break *<addr>             Set a breakpoint at an address (hex)
+      info breakpoints, i b     List breakpoints
+      watch <var>               Set a hardware watchpoint on writes to a variable (requires DWARF info)
+      watch *<addr-expr> [len]  Set a watchpoint on writes to an address (default length: 8 bytes)
+      info watchpoints, i w     List watchpoints
+      delete <n>, d <n>         Delete breakpoint/watchpoint n
+      continue, c               Resume execution
+      stepi, si                 Execute one machine instruction
+      nexti, ni                 Execute one machine instruction, stepping over calls
+      step, s                   Step one source line, stepping into calls (requires DWARF info)
+      next, n                   Step one source line, stepping over calls (requires DWARF info)
+      up                        Run until the current function returns to its caller
+      backtrace, bt             Show the call stack
+      syms [filter]             List ELF symbols (functions), optionally filtered by substring
+      lines [func]              Show line-number info (address/file/line) (requires DWARF info)
+      list, l                   Show source code (current location, or main if not running)
+      list <func>               Show source centered on a function's start (requires DWARF info)
+      list <line>                Show source at a line in the current (or main's) file
+      list <file>:<line>        Show source at a line in the given file (requires DWARF info)
+      list *<addr>              Show source at the line for an address (hex; runtime address
+                                  while running)
+      info registers, i r       Show all registers (general-purpose, rip, eflags, orig_rax,
+                                  segment, fs_base/gs_base, x87 st0-st7, SSE xmm0-xmm15, mxcsr)
+      print <expr>, p <expr>    Evaluate and print an expression (e.g. p $rax, p x+1, p *$rsp,
+                                  p &x, p ptr->field, p ptr.field, p arr, p arr[0],
+                                  p arr[0]->x)
+      print/fmt <expr>          Print with a format (fmt: x=hex o=octal t=binary d/i=decimal
+                                  c=char s=string, e.g. p/x $rax)
+      set $<reg>=<expr>         Set a register (st0-st7 as floating point, xmm0-xmm15 as the
+                                  low 64 bits)
+      set <var>=<expr>          Set a local variable/parameter (requires DWARF info)
+      set <var>-><member>=<expr>   Set a struct member (-> and . are equivalent) (requires DWARF info)
+      set <var>[<index>]=<expr>    Set an array/pointer element (requires DWARF info)
+      set print pretty on|off   Show structs indented across multiple lines (default off)
+      set print elements <n>|unlimited
+                                Element limit for strings (/s) / struct display (default 200)
+      show print                Show the current print pretty/elements settings
+      show locals               List local variables of the current function (requires DWARF info)
+      show args                 List parameters of the current function (requires DWARF info)
+      show globals               List global variables (requires DWARF info)
+      x/<n> <addr>              Dump memory as bytes
+      set *<addr-expr>=<expr>   Patch one byte of memory (e.g. set *0x4011a0=0x90)
+      leak on|off               Enable/disable heap leak tracking (malloc/calloc/realloc/free)
+      leak                      Show leak-tracking status (on/off, alloc/free counts)
+      leaks                     List unfreed heap allocations (requires leak on and a continue)
+      lang <en|ja>              Switch the UI language (currently affects only this help text)
+      kill, k                   Kill the running process
+      help, h, ?                Show this help
+      quit, q                   Quit the debugger
+
+# ---- main.rs ----
+main.usage:
+  ja: "使い方: tdb <対象プログラム> [引数...]"
+  en: "Usage: tdb <program> [args...]"
+main.program_not_found:
+  ja: "プログラムが見つかりません: %{path}"
+  en: "Program not found: %{path}"
+
+# ---- expr.rs ----
+expr.float_op_unsupported:
+  ja: "演算 '%{op}' に浮動小数点数は使えません"
+  en: "Operator '%{op}' cannot be used with floating-point numbers"
+expr.deref_op:
+  ja: "* (デリファレンス)"
+  en: "* (dereference)"
+expr.reg_name_missing:
+  ja: "'$' の後にレジスタ名がありません"
+  en: "A register name is required after '$'"
+expr.invalid_char:
+  ja: "式に不正な文字があります: '%{c}'"
+  en: "Invalid character in expression: '%{c}'"
+expr.div_by_zero:
+  ja: "0 による除算です"
+  en: "Division by zero"
+expr.rem_by_zero:
+  ja: "0 による剰余演算です"
+  en: "Modulo by zero"
+expr.amp_var_only:
+  ja: "'&' は変数名にのみ使えます (例: &x)"
+  en: "'&' can only be used with a variable name (e.g. &x)"
+expr.member_name_required:
+  ja: "'%{op}' の後にはメンバ名が必要です (与えられたもの: %{other})"
+  en: "A member name is required after '%{op}' (got: %{other})"
+expr.rbracket_missing:
+  ja: "'[' に対応する ']' がありません (与えられたもの: %{other})"
+  en: "Missing ']' matching '[' (got: %{other})"
+expr.rparen_missing:
+  ja: "閉じ括弧 ')' がありません"
+  en: "Missing closing ')'"
+expr.parse_failed:
+  ja: "式を解析できません (予期しないトークン: %{other})"
+  en: "Failed to parse expression (unexpected token: %{other})"
+expr.empty:
+  ja: "式が空です"
+  en: "Expression is empty"
+expr.trailing_input:
+  ja: "式の末尾に余分な入力があります"
+  en: "Unexpected input after the end of the expression"
+
+# ---- repl.rs ----
+repl.banner:
+  ja: "tdb -- 簡易 Linux/C デバッガ (対象: %{path})"
+  en: "tdb -- a simple Linux/C debugger (target: %{path})"
+repl.banner_hint:
+  ja: "'help' でコマンド一覧を表示します。"
+  en: "Type 'help' to see the list of commands."
+repl.ctrl_c_hint:
+  ja: "(Ctrl-C: 'quit' で終了)"
+  en: "(Ctrl-C: type 'quit' to exit)"
+repl.input_error:
+  ja: "入力エラー: %{err}"
+  en: "Input error: %{err}"
+repl.usage_break:
+  ja: "使い方: break <func> | break <ファイル>:<行番号> | break *<addr>"
+  en: "Usage: break <func> | break <file>:<line> | break *<addr>"
+repl.usage_info:
+  ja: "使い方: info breakpoints | info watchpoints | info registers"
+  en: "Usage: info breakpoints | info watchpoints | info registers"
+repl.usage_delete:
+  ja: "使い方: delete <番号> (ブレークポイント/ウォッチポイント共通の番号)"
+  en: "Usage: delete <number> (shared numbering for breakpoints/watchpoints)"
+repl.leak_unknown_arg:
+  ja: "不明な引数: '%{arg}' (使い方: leak on | leak off | leak)"
+  en: "Unknown argument: '%{arg}' (usage: leak on | leak off | leak)"
+repl.usage_show:
+  ja: "使い方: show print | show locals | show args | show globals"
+  en: "Usage: show print | show locals | show args | show globals"
+repl.usage_set:
+  ja: "使い方: set $<レジスタ名>=<値> | set print ..."
+  en: "Usage: set $<register>=<value> | set print ..."
+repl.lang_switched:
+  ja: "表示言語を '%{lang}' に切り替えました"
+  en: "Language switched to '%{lang}'"
+repl.lang_unknown:
+  ja: "不明な言語: '%{arg}' (使用可能: en, ja)"
+  en: "Unknown language: '%{arg}' (available: en, ja)"
+repl.lang_current:
+  ja: "現在の言語: %{lang}"
+  en: "Current language: %{lang}"
+repl.usage_examine_bytes:
+  ja: "使い方: x/<バイト数> <アドレス>"
+  en: "Usage: x/<byte-count> <address>"
+repl.unknown_command:
+  ja: "不明なコマンド: '%{cmd}' ('help' を参照)"
+  en: "Unknown command: '%{cmd}' (see 'help')"
+repl.error_prefix:
+  ja: "エラー: %{err}"
+  en: "Error: %{err}"
+repl.fmt_struct_unsupported:
+  ja: "構造体/配列にはフォーマット指定 (/%{f}) は使えません"
+  en: "Format specifiers (/%{f}) cannot be used with structs/arrays"
+repl.fmt_unknown:
+  ja: "不明なフォーマット指定です: /%{other} (x, o, t, d, i, c, s が使えます)"
+  en: "Unknown format specifier: /%{other} (x, o, t, d, i, c, s are supported)"
+repl.usage_set_print_elements:
+  ja: "使い方: set print elements <数値>|unlimited"
+  en: "Usage: set print elements <number>|unlimited"
+repl.usage_set_print:
+  ja: "使い方: set print pretty on|off | set print elements <数値>|unlimited"
+  en: "Usage: set print pretty on|off | set print elements <number>|unlimited"
+repl.usage_watch:
+  ja: "使い方: watch <変数名> | watch *<addr式> [長さ(1/2/4/8, 既定8)]"
+  en: "Usage: watch <var> | watch *<addr-expr> [length(1/2/4/8, default 8)]"
+repl.watch_len_parse_failed:
+  ja: "長さの解析に失敗しました: '%{s}'"
+  en: "Failed to parse length: '%{s}'"
+repl.usage_examine_n:
+  ja: "使い方: x/<n> <addr>"
+  en: "Usage: x/<n> <addr>"
+repl.usage_set_full:
+  ja: "使い方: set $<レジスタ名>=<式> | set *<addr式>=<式> | set <変数名>=<式> | set <変数名>-><メンバ名>=<式> | set <変数名>.<メンバ名>=<式> | set <変数名>[<添字>]=<式>"
+  en: "Usage: set $<register>=<expr> | set *<addr-expr>=<expr> | set <var>=<expr> | set <var>-><member>=<expr> | set <var>.<member>=<expr> | set <var>[<index>]=<expr>"
+repl.usage_print:
+  ja: "使い方: print[/fmt] <式> (fmt: x=16進 o=8進 t=2進 d/i=10進 c=文字 s=文字列, 例: p/x $rax)"
+  en: "Usage: print[/fmt] <expr> (fmt: x=hex o=octal t=binary d/i=decimal c=char s=string, e.g. p/x $rax)"
+
+# ---- debugger.rs ----
+dbg.sigint_setup_failed:
+  ja: "警告: SIGINT ハンドラの設定に失敗しました: %{err}"
+  en: "Warning: failed to set up SIGINT handler: %{err}"
+dbg.not_running:
+  ja: "プロセスは実行されていません ('run' を先に実行してください)"
+  en: "The process is not running (run 'run' first)"
+dbg.already_running:
+  ja: "既にプロセスは実行中です"
+  en: "The process is already running"
+dbg.unexpected_initial_stop:
+  ja: "予期しない初回停止状態: %{other}"
+  en: "Unexpected initial stop state: %{other}"
+dbg.bp_install_failed_named:
+  ja: "警告: ブレークポイント '%{spec}' の設置に失敗しました: %{err}"
+  en: "Warning: failed to set breakpoint '%{spec}': %{err}"
+dbg.pending_break_deferred:
+  ja: "(未実行のため、'run' 実行時に '%{spec}' を解決します)"
+  en: "(Not running yet -- '%{spec}' will be resolved when 'run' is executed)"
+dbg.symbol_not_found:
+  ja: "シンボル '%{name}' が見つかりません"
+  en: "Symbol '%{name}' not found"
+dbg.file_lineinfo_not_found:
+  ja: "ファイル '%{file}' の行番号情報が見つかりません"
+  en: "No line info found for file '%{file}'"
+dbg.no_code_after_line:
+  ja: "ファイル '%{file}' の %{line} 行目以降に実行可能なコードが見つかりません"
+  en: "No executable code found at or after line %{line} of file '%{file}'"
+dbg.bp_install_failed:
+  ja: "警告: ブレークポイント設置に失敗: %{err}"
+  en: "Warning: failed to set breakpoint: %{err}"
+dbg.process_started:
+  ja: "プロセスを起動しました (pid=%{pid}, entry=%{entry}%{pie})"
+  en: "Process started (pid=%{pid}, entry=%{entry}%{pie})"
+dbg.bp_set:
+  ja: "ブレークポイント %{id} を %{label} (%{addr}) に設定しました"
+  en: "Breakpoint %{id} set at %{label} (%{addr})"
+dbg.no_breakpoints:
+  ja: "ブレークポイントは設定されていません"
+  en: "No breakpoints are set"
+dbg.bp_inactive:
+  ja: "(未実行)"
+  en: "(inactive)"
+dbg.bp_not_found:
+  ja: "ブレークポイント %{id} は存在しません"
+  en: "Breakpoint %{id} does not exist"
+dbg.bp_deleted:
+  ja: "ブレークポイント %{id} を削除しました"
+  en: "Breakpoint %{id} deleted"
+dbg.var_not_found:
+  ja: "変数 '%{name}' が見つかりません(現在のスコープ外か、デバッグ情報がありません)"
+  en: "Variable '%{name}' not found (out of scope, or no debug info)"
+dbg.watch_bad_size:
+  ja: "ウォッチポイントのサイズは1/2/4/8バイトのいずれかである必要があります"
+  en: "Watchpoint size must be 1, 2, 4, or 8 bytes"
+dbg.watch_unaligned:
+  ja: "ウォッチポイントのアドレス %{addr} は %{len} バイト境界に整列していません"
+  en: "Watchpoint address %{addr} is not aligned to a %{len}-byte boundary"
+dbg.watch_max:
+  ja: "ウォッチポイントは(ハードウェアの制約により)最大4つまでです"
+  en: "At most 4 watchpoints are supported (hardware limitation)"
+dbg.watch_set:
+  ja: "ウォッチポイント %{id} を %{label} (%{addr}, %{len}バイト) に設定しました"
+  en: "Watchpoint %{id} set at %{label} (%{addr}, %{len} bytes)"
+dbg.no_watchpoints:
+  ja: "ウォッチポイントは設定されていません"
+  en: "No watchpoints are set"
+dbg.watch_list_line:
+  ja: "%{id}: %{label} (%{addr}, %{len}バイト)  現在値 = %{val}"
+  en: "%{id}: %{label} (%{addr}, %{len} bytes)  current value = %{val}"
+dbg.watch_not_found:
+  ja: "ウォッチポイント %{id} は存在しません"
+  en: "Watchpoint %{id} does not exist"
+dbg.watch_deleted:
+  ja: "ウォッチポイント %{id} を削除しました"
+  en: "Watchpoint %{id} deleted"
+dbg.watch_triggered:
+  ja: "ウォッチポイント %{id} がトリガーされました: %{label} (%{addr})\n  旧値 = %{old}\n  新値 = %{new}"
+  en: "Watchpoint %{id} triggered: %{label} (%{addr})\n  old value = %{old}\n  new value = %{new}"
+dbg.process_exited:
+  ja: "[プロセスは終了しました (code=%{code})]"
+  en: "[Process exited (code=%{code})]"
+dbg.process_signaled:
+  ja: "[プロセスはシグナル %{sig} で終了しました]"
+  en: "[Process terminated by signal %{sig}]"
+dbg.unexpected_wait:
+  ja: "予期しない wait 状態: %{other}"
+  en: "Unexpected wait status: %{other}"
+dbg.bp_hit:
+  ja: "ブレークポイントで停止: %{addr} <%{sym}>"
+  en: "Stopped at breakpoint: %{addr} <%{sym}>"
+dbg.no_frame_pointer:
+  ja: "フレームポインタ (rbp) が取得できないため、呼び出し元を辿れません"
+  en: "Cannot trace the caller: unable to obtain the frame pointer (rbp)"
+dbg.no_caller_addr:
+  ja: "呼び出し元アドレスを取得できません"
+  en: "Cannot obtain the caller's address"
+dbg.stopped_sigtrap:
+  ja: "停止 (SIGTRAP): rip=%{rip}"
+  en: "Stopped (SIGTRAP): rip=%{rip}"
+dbg.stopped_signal:
+  ja: "シグナル %{sig} を受信して停止しました"
+  en: "Stopped after receiving signal %{sig}"
+dbg.leak_tracking_state:
+  ja: "メモリリーク追跡: %{state}"
+  en: "Memory leak tracking: %{state}"
+dbg.leak_disabled:
+  ja: "メモリリーク追跡は無効です ('leak on' で有効にしてください)"
+  en: "Memory leak tracking is disabled (run 'leak on' to enable it)"
+dbg.leak_stats:
+  ja: "確保: %{allocs} 回, 解放: %{frees} 回, 未解放: %{live} 件, 追跡外への free: %{bad} 件"
+  en: "Allocs: %{allocs}, Frees: %{frees}, Live: %{live}, Untracked frees: %{bad}"
+dbg.leak_none:
+  ja: "未解放のヒープ確保はありません (確保 %{allocs} 回, 解放 %{frees} 回)"
+  en: "No unfreed heap allocations (allocs: %{allocs}, frees: %{frees})"
+dbg.leak_summary:
+  ja: "未解放のヒープ確保: %{count} 件, 合計 %{total} バイト"
+  en: "Unfreed heap allocations: %{count}, total %{total} bytes"
+dbg.leak_entry:
+  ja: "  %{addr}  %{size} バイト  確保元: %{func} (%{loc})"
+  en: "  %{addr}  %{size} bytes  allocated by: %{func} (%{loc})"
+dbg.leak_bad_frees_header:
+  ja: "警告: 追跡外のポインタへの free (二重解放の可能性): %{count} 件"
+  en: "Warning: frees of untracked pointers (possible double-free): %{count}"
+dbg.leak_warmup_failed:
+  ja: "警告: メモリリーク追跡の準備実行に失敗しました: %{err}"
+  en: "Warning: leak-tracking warm-up run failed: %{err}"
+dbg.disasm_read_failed:
+  ja: "警告: 逆アセンブル用のメモリ読み取りに失敗: %{err}"
+  en: "Warning: failed to read memory for disassembly: %{err}"
+dbg.process_killed:
+  ja: "プロセスを終了しました"
+  en: "Process terminated"
+dbg.fpregs_failed:
+  ja: "警告: 浮動小数点レジスタの取得に失敗しました: %{err}"
+  en: "Warning: failed to read floating-point registers: %{err}"
+dbg.unknown_register:
+  ja: "不明なレジスタ: %{name}"
+  en: "Unknown register: %{name}"
+dbg.no_pc_function_info:
+  ja: "現在の PC の関数情報が見つかりません(デバッグ情報がないか、実行中の位置が不明です)"
+  en: "No function info found for the current PC (no debug info, or the running location is unknown)"
+dbg.no_locals:
+  ja: "ローカル変数はありません"
+  en: "No local variables"
+dbg.no_params:
+  ja: "仮引数はありません"
+  en: "No parameters"
+dbg.var_error:
+  ja: "%{name} = <エラー: %{err}>"
+  en: "%{name} = <error: %{err}>"
+dbg.no_globals:
+  ja: "グローバル変数はありません"
+  en: "No global variables"
+dbg.chain_empty:
+  ja: "'->' または '[]' の後に何もありません"
+  en: "Nothing follows '->' or '[]'"
+dbg.member_not_found:
+  ja: "メンバ '%{field}' が見つかりません"
+  en: "Member '%{field}' not found"
+dbg.not_struct_or_pointer:
+  ja: "'%{name}' は構造体でもポインタでもないため、'->%{field}' を評価できません"
+  en: "'%{name}' is neither a struct nor a pointer, cannot evaluate '->%{field}'"
+dbg.not_array_or_pointer:
+  ja: "'%{name}' は配列でもポインタでもないため、'[%{idx}]' を評価できません"
+  en: "'%{name}' is neither an array nor a pointer, cannot evaluate '[%{idx}]'"
+dbg.write_unsupported_type:
+  ja: "この型への書き込みには対応していません"
+  en: "Writing to this type is not supported"
+dbg.no_frame_base:
+  ja: "frame_base 情報がありません"
+  en: "No frame_base information available"
+dbg.frame_base_parse_failed:
+  ja: "frame_base の DWARF 式を解析できません"
+  en: "Failed to parse the frame_base DWARF expression"
+dbg.unsupported_frame_base_expr:
+  ja: "対応していない frame_base 式です (opcode %{op})"
+  en: "Unsupported frame_base expression (opcode %{op})"
+dbg.no_var_location:
+  ja: "変数の位置情報がありません"
+  en: "No location information for the variable"
+dbg.var_expr_parse_failed:
+  ja: "変数の DWARF 式を解析できません"
+  en: "Failed to parse the variable's DWARF expression"
+dbg.dw_op_addr_missing_operand:
+  ja: "DW_OP_addr のオペランドが不足しています"
+  en: "DW_OP_addr is missing its operand"
+dbg.unsupported_var_location_expr:
+  ja: "対応していない変数位置式です (opcode %{op})"
+  en: "Unsupported variable location expression (opcode %{op})"
+dbg.unsupported_dwarf_reg:
+  ja: "対応していない DWARF レジスタ番号です: %{other}"
+  en: "Unsupported DWARF register number: %{other}"
+dbg.reg_get_failed:
+  ja: "レジスタ '%{name}' の取得に失敗しました"
+  en: "Failed to read register '%{name}'"
+dbg.mem_read_failed:
+  ja: "メモリ読み取りに失敗"
+  en: "Memory read failed"
+dbg.mem_write_failed:
+  ja: "メモリ書き込みに失敗"
+  en: "Memory write failed"
+dbg.no_symbols:
+  ja: "シンボルが見つかりません"
+  en: "No symbols found"
+dbg.no_lineinfo:
+  ja: "行番号情報が見つかりません(DWARF情報が無いか、指定した関数が見つかりません)"
+  en: "No line info found (no DWARF info, or the specified function was not found)"
+dbg.line_parse_failed:
+  ja: "行番号の解析に失敗しました: '%{s}'"
+  en: "Failed to parse line number: '%{s}'"
+dbg.list_no_location:
+  ja: "表示位置を特定できません。関数名か 'ファイル:行番号' を指定してください"
+  en: "Cannot determine a location to show. Specify a function name or 'file:line'"
+dbg.list_no_location_no_dwarf:
+  ja: "表示位置を特定できません(DWARF情報がありません)"
+  en: "Cannot determine a location to show (no DWARF info)"
+dbg.addr_lineinfo_not_found:
+  ja: "アドレス %{addr} に対応する行番号情報が見つかりません"
+  en: "No line info found for address %{addr}"
+dbg.function_not_found:
+  ja: "関数 '%{name}' が見つかりません"
+  en: "Function '%{name}' not found"
+dbg.function_lineinfo_not_found:
+  ja: "関数 '%{name}' の行番号情報が見つかりません(DWARF情報がありません)"
+  en: "No line info found for function '%{name}' (no DWARF info)"
+dbg.source_open_failed:
+  ja: "ソースファイル '%{path}' を開けません"
+  en: "Cannot open source file '%{path}'"
+dbg.no_source_in_range:
+  ja: "(指定した行番号の範囲にソースがありません)"
+  en: "(No source in the specified line range)"
+dbg.addr_parse_failed:
+  ja: "アドレスの解析に失敗しました (16進数を指定してください)"
+  en: "Failed to parse address (please specify a hexadecimal number)"

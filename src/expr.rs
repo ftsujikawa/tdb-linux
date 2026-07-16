@@ -1,5 +1,6 @@
 use crate::debugger::Debugger;
 use anyhow::{bail, Result};
+use rust_i18n::t;
 
 /// `print`/`set` で使う簡易式評価器。
 /// レジスタ参照 (`$rax` など)、DWARF 情報から解決するローカル変数/仮引数名
@@ -39,7 +40,7 @@ impl Value {
 fn require_int(v: Value, op: &str) -> Result<i64> {
     match v {
         Value::Int(i) => Ok(i),
-        Value::Float(_) => bail!("演算 '{}' に浮動小数点数は使えません", op),
+        Value::Float(_) => bail!("{}", t!("expr.float_op_unsupported", op = op)),
     }
 }
 
@@ -174,7 +175,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
                     j += 1;
                 }
                 if j == start {
-                    bail!("'$' の後にレジスタ名がありません");
+                    bail!("{}", t!("expr.reg_name_missing"));
                 }
                 tokens.push(Token::Reg(chars[start..j].iter().collect()));
                 i = j;
@@ -220,7 +221,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
                 }
                 i = j;
             }
-            _ => bail!("式に不正な文字があります: '{}'", c),
+            _ => bail!("{}", t!("expr.invalid_char", c = c)),
         }
     }
     Ok(tokens)
@@ -336,7 +337,7 @@ impl<'a> Parser<'a> {
                     } else {
                         let r = right.as_i64();
                         if r == 0 {
-                            bail!("0 による除算です");
+                            bail!("{}", t!("expr.div_by_zero"));
                         }
                         left = Value::Int(left.as_i64().wrapping_div(r));
                     }
@@ -349,7 +350,7 @@ impl<'a> Parser<'a> {
                     } else {
                         let r = right.as_i64();
                         if r == 0 {
-                            bail!("0 による剰余演算です");
+                            bail!("{}", t!("expr.rem_by_zero"));
                         }
                         left = Value::Int(left.as_i64().wrapping_rem(r));
                     }
@@ -385,7 +386,7 @@ impl<'a> Parser<'a> {
             Some(Token::Star) => {
                 self.advance();
                 let addr_val = self.parse_unary()?;
-                let addr = require_int(addr_val, "* (デリファレンス)")? as u64;
+                let addr = require_int(addr_val, &t!("expr.deref_op"))? as u64;
                 let bytes = self.dbg.read_mem(addr, 8)?;
                 Ok(Value::Int(i64::from_ne_bytes(bytes.try_into().unwrap())))
             }
@@ -393,7 +394,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 match self.advance() {
                     Some(Token::Ident(name)) => Ok(Value::Int(self.dbg.variable_address(&name)? as i64)),
-                    _ => bail!("'&' は変数名にのみ使えます (例: &x)"),
+                    _ => bail!("{}", t!("expr.amp_var_only")),
                 }
             }
             _ => self.parse_postfix(),
@@ -432,7 +433,9 @@ impl<'a> Parser<'a> {
                 self.advance();
                 match self.advance() {
                     Some(Token::Ident(field)) => Ok(Some(ChainStep::Field(field))),
-                    other => bail!("'{}' の後にはメンバ名が必要です (与えられたもの: {:?})", op, other),
+                    other => {
+                        bail!("{}", t!("expr.member_name_required", op = op, other = other : {:?}))
+                    }
                 }
             }
             Some(Token::LBracket) => {
@@ -440,7 +443,7 @@ impl<'a> Parser<'a> {
                 let idx_val = self.parse_expr()?;
                 match self.advance() {
                     Some(Token::RBracket) => Ok(Some(ChainStep::Index(idx_val.as_i64()))),
-                    other => bail!("'[' に対応する ']' がありません (与えられたもの: {:?})", other),
+                    other => bail!("{}", t!("expr.rbracket_missing", other = other : {:?})),
                 }
             }
             _ => Ok(None),
@@ -457,10 +460,10 @@ impl<'a> Parser<'a> {
                 let v = self.parse_expr()?;
                 match self.advance() {
                     Some(Token::RParen) => Ok(v),
-                    _ => bail!("閉じ括弧 ')' がありません"),
+                    _ => bail!("{}", t!("expr.rparen_missing")),
                 }
             }
-            other => bail!("式を解析できません (予期しないトークン: {:?})", other),
+            other => bail!("{}", t!("expr.parse_failed", other = other : {:?})),
         }
     }
 }
@@ -469,12 +472,12 @@ impl<'a> Parser<'a> {
 pub fn eval(input: &str, dbg: &Debugger) -> Result<Value> {
     let tokens = tokenize(input)?;
     if tokens.is_empty() {
-        bail!("式が空です");
+        bail!("{}", t!("expr.empty"));
     }
     let mut parser = Parser { tokens, pos: 0, dbg };
     let value = parser.parse_expr()?;
     if parser.pos != parser.tokens.len() {
-        bail!("式の末尾に余分な入力があります");
+        bail!("{}", t!("expr.trailing_input"));
     }
     Ok(value)
 }

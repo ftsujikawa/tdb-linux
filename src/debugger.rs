@@ -12,6 +12,7 @@ use nix::sys::ptrace;
 use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{execv, fork, ForkResult, Pid};
+use rust_i18n::t;
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::fs;
@@ -35,7 +36,7 @@ pub fn install_sigint_forwarder() {
     let mut signals = match Signals::new([SIGINT]) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("警告: SIGINT ハンドラの設定に失敗しました: {}", e);
+            eprintln!("{}", t!("dbg.sigint_setup_failed", err = e));
             return;
         }
     };
@@ -161,7 +162,7 @@ impl Debugger {
     }
 
     fn pid(&self) -> Result<Pid> {
-        self.pid.ok_or_else(|| anyhow!("プロセスは実行されていません ('run' を先に実行してください)"))
+        self.pid.ok_or_else(|| anyhow!("{}", t!("dbg.not_running")))
     }
 
     /// デバッグ対象の終了を記録する。SIGINT 転送スレッドが古い(既に
@@ -174,7 +175,7 @@ impl Debugger {
     /// 子プロセスを起動し、execve 直後の初回停止まで待つ。
     pub fn start(&mut self) -> Result<()> {
         if self.is_running() {
-            bail!("既にプロセスは実行中です");
+            bail!("{}", t!("dbg.already_running"));
         }
         self.breakpoints.clear();
         self.bp_ids.clear();
@@ -204,7 +205,7 @@ impl Debugger {
                 DEBUGGEE_PID.store(child.as_raw(), Ordering::SeqCst);
                 match waitpid(child, None)? {
                     WaitStatus::Stopped(_, Signal::SIGTRAP) => {}
-                    other => bail!("予期しない初回停止状態: {:?}", other),
+                    other => bail!("{}", t!("dbg.unexpected_initial_stop", other = other : {:?})),
                 }
             }
         }
@@ -218,15 +219,18 @@ impl Debugger {
         let pending: Vec<String> = self.pending_breaks.drain(..).collect();
         for spec in pending {
             if let Err(e) = self.install_breakpoint_by_spec(&spec) {
-                eprintln!("警告: ブレークポイント '{}' の設置に失敗しました: {}", spec, e);
+                eprintln!("{}", t!("dbg.bp_install_failed_named", spec = spec, err = e));
             }
         }
 
         println!(
-            "プロセスを起動しました (pid={}, entry={:#x}{})",
-            self.pid()?.as_raw(),
-            self.entry(),
-            if self.elf.is_pie { ", PIE" } else { "" }
+            "{}",
+            t!(
+                "dbg.process_started",
+                pid = self.pid()?.as_raw(),
+                entry = format!("{:#x}", self.entry()),
+                pie = if self.elf.is_pie { ", PIE" } else { "" }
+            )
         );
 
         Ok(())
@@ -263,7 +267,7 @@ impl Debugger {
         }
         if !self.is_running() {
             self.pending_breaks.push(spec.to_string());
-            println!("(未実行のため、'run' 実行時に '{}' を解決します)", spec);
+            println!("{}", t!("dbg.pending_break_deferred", spec = spec));
             return Ok(());
         }
         self.install_breakpoint_by_spec(spec)
@@ -286,7 +290,7 @@ impl Debugger {
         let sym = self
             .elf
             .find_by_name(name)
-            .ok_or_else(|| anyhow!("シンボル '{}' が見つかりません", name))?
+            .ok_or_else(|| anyhow!("{}", t!("dbg.symbol_not_found", name = name)))?
             .clone();
         let entry_addr = self.runtime_addr(sym.addr);
         let addr = self.skip_prologue_addr(&sym, entry_addr);
@@ -322,11 +326,11 @@ impl Debugger {
             })
             .collect();
         if candidates.is_empty() {
-            bail!("ファイル '{}' の行番号情報が見つかりません", file_part);
+            bail!("{}", t!("dbg.file_lineinfo_not_found", file = file_part));
         }
         candidates.sort_by_key(|r| (r.line, r.addr));
         let row = candidates.into_iter().find(|r| r.line >= line).ok_or_else(|| {
-            anyhow!("ファイル '{}' の {} 行目以降に実行可能なコードが見つかりません", file_part, line)
+            anyhow!("{}", t!("dbg.no_code_after_line", file = file_part, line = line))
         })?;
         Ok((row.addr, row.file.clone(), row.line))
     }
@@ -364,17 +368,17 @@ impl Debugger {
         if self.is_running() {
             if let Some(pid) = self.pid {
                 if let Err(e) = bp.enable(pid) {
-                    eprintln!("警告: ブレークポイント設置に失敗: {}", e);
+                    eprintln!("{}", t!("dbg.bp_install_failed", err = e));
                 }
             }
         }
         self.breakpoints.insert(addr, bp);
-        println!("ブレークポイント {} を {} ({:#x}) に設定しました", id, label, addr);
+        println!("{}", t!("dbg.bp_set", id = id, label = label, addr = format!("{:#x}", addr)));
     }
 
     pub fn list_breakpoints(&self) {
         if self.bp_ids.is_empty() {
-            println!("ブレークポイントは設定されていません");
+            println!("{}", t!("dbg.no_breakpoints"));
             return;
         }
         for (id, addr) in self.bp_ids.iter() {
@@ -393,14 +397,8 @@ impl Debugger {
                 Some(row) => format!(" at {}:{}", row.file.display(), row.line),
                 None => String::new(),
             };
-            println!(
-                "{}: {:#x} <{}>{} {}",
-                id,
-                addr,
-                sym,
-                loc,
-                if enabled { "" } else { "(未実行)" }
-            );
+            let inactive = if enabled { String::new() } else { t!("dbg.bp_inactive").to_string() };
+            println!("{}: {:#x} <{}>{} {}", id, addr, sym, loc, inactive);
         }
     }
 
@@ -414,7 +412,7 @@ impl Debugger {
         let addr = self
             .bp_ids
             .remove(&id)
-            .ok_or_else(|| anyhow!("ブレークポイント {} は存在しません", id))?;
+            .ok_or_else(|| anyhow!("{}", t!("dbg.bp_not_found", id = id)))?;
         if let Some(mut bp) = self.breakpoints.remove(&addr) {
             if let Some(pid) = self.pid {
                 if !self.exited {
@@ -422,7 +420,7 @@ impl Debugger {
                 }
             }
         }
-        println!("ブレークポイント {} を削除しました", id);
+        println!("{}", t!("dbg.bp_deleted", id = id));
         Ok(())
     }
 
@@ -442,7 +440,7 @@ impl Debugger {
             .globals()
             .iter()
             .find(|v| v.name == name)
-            .ok_or_else(|| anyhow!("変数 '{}' が見つかりません(現在のスコープ外か、デバッグ情報がありません)", name))?;
+            .ok_or_else(|| anyhow!("{}", t!("dbg.var_not_found", name = name)))?;
         let addr = self.eval_location(&var.location, 0, &regs)?;
         Ok((addr, var.ty.byte_size()))
     }
@@ -452,17 +450,17 @@ impl Debugger {
     /// レジスタの制約)。DR0-DR3 の空きスロットを探して使うため、最大4つまで。
     pub fn add_watchpoint(&mut self, addr: u64, len: u8, label: String) -> Result<()> {
         if ![1u8, 2, 4, 8].contains(&len) {
-            bail!("ウォッチポイントのサイズは1/2/4/8バイトのいずれかである必要があります");
+            bail!("{}", t!("dbg.watch_bad_size"));
         }
         if addr % len as u64 != 0 {
-            bail!("ウォッチポイントのアドレス {:#x} は {} バイト境界に整列していません", addr, len);
+            bail!("{}", t!("dbg.watch_unaligned", addr = format!("{:#x}", addr), len = len));
         }
         let pid = self.pid()?;
         let slot = self
             .watchpoints
             .iter()
             .position(|w| w.is_none())
-            .ok_or_else(|| anyhow!("ウォッチポイントは(ハードウェアの制約により)最大4つまでです"))?;
+            .ok_or_else(|| anyhow!("{}", t!("dbg.watch_max")))?;
 
         let bytes = self.read_mem(addr, len as usize)?;
         let last_value = bytes_to_u64(&bytes);
@@ -472,13 +470,16 @@ impl Debugger {
         self.next_bp_id += 1;
         self.wp_ids.insert(id, slot);
         self.watchpoints[slot] = Some(Watchpoint { addr, len, label: label.clone(), last_value });
-        println!("ウォッチポイント {} を {} ({:#x}, {}バイト) に設定しました", id, label, addr, len);
+        println!(
+            "{}",
+            t!("dbg.watch_set", id = id, label = label, addr = format!("{:#x}", addr), len = len)
+        );
         Ok(())
     }
 
     pub fn list_watchpoints(&self) {
         if self.wp_ids.is_empty() {
-            println!("ウォッチポイントは設定されていません");
+            println!("{}", t!("dbg.no_watchpoints"));
             return;
         }
         let mut items: Vec<(&u32, &usize)> = self.wp_ids.iter().collect();
@@ -486,22 +487,29 @@ impl Debugger {
         for (id, &slot) in items {
             if let Some(wp) = &self.watchpoints[slot] {
                 println!(
-                    "{}: {} ({:#x}, {}バイト)  現在値 = {:#x}",
-                    id, wp.label, wp.addr, wp.len, wp.last_value
+                    "{}",
+                    t!(
+                        "dbg.watch_list_line",
+                        id = id,
+                        label = &wp.label,
+                        addr = format!("{:#x}", wp.addr),
+                        len = wp.len,
+                        val = format!("{:#x}", wp.last_value)
+                    )
                 );
             }
         }
     }
 
     fn delete_watchpoint(&mut self, id: u32) -> Result<()> {
-        let slot = self.wp_ids.remove(&id).ok_or_else(|| anyhow!("ウォッチポイント {} は存在しません", id))?;
+        let slot = self.wp_ids.remove(&id).ok_or_else(|| anyhow!("{}", t!("dbg.watch_not_found", id = id)))?;
         self.watchpoints[slot] = None;
         if let Some(pid) = self.pid {
             if !self.exited {
                 self.uninstall_watch_slot(pid, slot)?;
             }
         }
-        println!("ウォッチポイント {} を削除しました", id);
+        println!("{}", t!("dbg.watch_deleted", id = id));
         Ok(())
     }
 
@@ -568,10 +576,17 @@ impl Debugger {
             if let Some(wp) = self.watchpoints[slot].as_mut() {
                 wp.last_value = new_value;
             }
-            messages.push(format!(
-                "ウォッチポイント {} がトリガーされました: {} ({:#x})\n  旧値 = {:#x}\n  新値 = {:#x}",
-                id, label, addr, old_value, new_value
-            ));
+            messages.push(
+                t!(
+                    "dbg.watch_triggered",
+                    id = id,
+                    label = label,
+                    addr = format!("{:#x}", addr),
+                    old = format!("{:#x}", old_value),
+                    new = format!("{:#x}", new_value)
+                )
+                .to_string(),
+            );
         }
         registers::write_dr(pid, 6, 0)?;
         Ok(if messages.is_empty() { None } else { Some(messages.join("\n")) })
@@ -597,7 +612,7 @@ impl Debugger {
                 match waitpid(pid, None)? {
                     WaitStatus::Exited(_, code) => {
                         self.mark_exited();
-                        println!("[プロセスは終了しました (code={})]", code);
+                        println!("{}", t!("dbg.process_exited", code = code));
                         return Ok(None);
                     }
                     WaitStatus::Stopped(_, Signal::SIGTRAP) => {
@@ -730,12 +745,12 @@ impl Debugger {
         match status {
             WaitStatus::Exited(_, code) => {
                 self.mark_exited();
-                println!("[プロセスは終了しました (code={})]", code);
+                println!("{}", t!("dbg.process_exited", code = code));
                 Ok(StepStop::Exited)
             }
             WaitStatus::Signaled(_, sig, _) => {
                 self.mark_exited();
-                println!("[プロセスはシグナル {} で終了しました]", sig);
+                println!("{}", t!("dbg.process_signaled", sig = sig));
                 Ok(StepStop::Signaled)
             }
             WaitStatus::Stopped(_, Signal::SIGTRAP) => {
@@ -761,7 +776,7 @@ impl Debugger {
                 }
             }
             other => {
-                println!("予期しない wait 状態: {:?}", other);
+                println!("{}", t!("dbg.unexpected_wait", other = other : {:?}));
                 Ok(StepStop::Unexpected)
             }
         }
@@ -787,7 +802,7 @@ impl Debugger {
                 StepStop::Exited | StepStop::Signaled | StepStop::Unexpected => return Ok(()),
                 StepStop::Breakpoint(addr) => {
                     let sym = self.symbol_at(addr);
-                    println!("ブレークポイントで停止: {:#x} <{}>", addr, sym);
+                    println!("{}", t!("dbg.bp_hit", addr = format!("{:#x}", addr), sym = sym));
                     self.show_stop_location(addr);
                     return Ok(());
                 }
@@ -864,7 +879,7 @@ impl Debugger {
                 StepStop::Exited | StepStop::Signaled | StepStop::Unexpected => return Ok(()),
                 StepStop::Breakpoint(addr) => {
                     let sym = self.symbol_at(addr);
-                    println!("ブレークポイントで停止: {:#x} <{}>", addr, sym);
+                    println!("{}", t!("dbg.bp_hit", addr = format!("{:#x}", addr), sym = sym));
                     self.show_stop_location(addr);
                     return Ok(());
                 }
@@ -946,11 +961,11 @@ impl Debugger {
         match waitpid(pid, None)? {
             WaitStatus::Exited(_, code) => {
                 self.mark_exited();
-                println!("[プロセスは終了しました (code={})]", code);
+                println!("{}", t!("dbg.process_exited", code = code));
             }
             WaitStatus::Signaled(_, sig, _) => {
                 self.mark_exited();
-                println!("[プロセスはシグナル {} で終了しました]", sig);
+                println!("{}", t!("dbg.process_signaled", sig = sig));
             }
             WaitStatus::Stopped(_, Signal::SIGTRAP) => {
                 let mut regs = registers::get_regs(pid)?;
@@ -976,12 +991,12 @@ impl Debugger {
         let pid = self.pid()?;
         let regs = registers::get_regs(pid)?;
         if regs.rbp == 0 {
-            bail!("フレームポインタ (rbp) が取得できないため、呼び出し元を辿れません");
+            bail!("{}", t!("dbg.no_frame_pointer"));
         }
         let ret_addr = self.read_mem(regs.rbp + 8, 8)?;
         let ret_addr = u64::from_ne_bytes(ret_addr.try_into().unwrap());
         if ret_addr == 0 {
-            bail!("呼び出し元アドレスを取得できません");
+            bail!("{}", t!("dbg.no_caller_addr"));
         }
 
         let had_bp = self.breakpoints.contains_key(&ret_addr);
@@ -1012,12 +1027,12 @@ impl Debugger {
             match waitpid(pid, None)? {
                 WaitStatus::Exited(_, code) => {
                     self.mark_exited();
-                    println!("[プロセスは終了しました (code={})]", code);
+                    println!("{}", t!("dbg.process_exited", code = code));
                     return Ok(());
                 }
                 WaitStatus::Signaled(_, sig, _) => {
                     self.mark_exited();
-                    println!("[プロセスはシグナル {} で終了しました]", sig);
+                    println!("{}", t!("dbg.process_signaled", sig = sig));
                     return Ok(());
                 }
                 WaitStatus::Stopped(_, Signal::SIGTRAP) => {
@@ -1040,20 +1055,20 @@ impl Debugger {
                             continue;
                         }
                         let sym = self.symbol_at(bp_addr);
-                        println!("ブレークポイントで停止: {:#x} <{}>", bp_addr, sym);
+                        println!("{}", t!("dbg.bp_hit", addr = format!("{:#x}", bp_addr), sym = sym));
                         self.show_stop_location(bp_addr);
                         return Ok(());
                     } else {
-                        println!("停止 (SIGTRAP): rip={:#x}", regs.rip);
+                        println!("{}", t!("dbg.stopped_sigtrap", rip = format!("{:#x}", regs.rip)));
                         return Ok(());
                     }
                 }
                 WaitStatus::Stopped(_, sig) => {
-                    println!("シグナル {} を受信して停止しました", sig);
+                    println!("{}", t!("dbg.stopped_signal", sig = sig));
                     return Ok(());
                 }
                 other => {
-                    println!("予期しない wait 状態: {:?}", other);
+                    println!("{}", t!("dbg.unexpected_wait", other = other : {:?}));
                     return Ok(());
                 }
             }
@@ -1070,37 +1085,43 @@ impl Debugger {
         if !on {
             self.uninstall_leak_breakpoints();
         }
-        println!("メモリリーク追跡: {}", if on { "on" } else { "off" });
+        println!("{}", t!("dbg.leak_tracking_state", state = if on { "on" } else { "off" }));
     }
 
     /// 現在の追跡状態(on/off・確保/解放回数・未解決の free)を表示する。
     pub fn show_leak_status(&self) {
-        println!("メモリリーク追跡: {}", if self.leak.enabled { "on" } else { "off" });
         println!(
-            "確保: {} 回, 解放: {} 回, 未解放: {} 件, 追跡外への free: {} 件",
-            self.leak.total_allocs,
-            self.leak.total_frees,
-            self.leak.live.len(),
-            self.leak.bad_frees.len()
+            "{}",
+            t!("dbg.leak_tracking_state", state = if self.leak.enabled { "on" } else { "off" })
+        );
+        println!(
+            "{}",
+            t!(
+                "dbg.leak_stats",
+                allocs = self.leak.total_allocs,
+                frees = self.leak.total_frees,
+                live = self.leak.live.len(),
+                bad = self.leak.bad_frees.len()
+            )
         );
     }
 
     /// 未解放のヒープ確保一覧を表示する (`leaks` コマンド)。
     pub fn list_leaks(&self) {
         if !self.leak.enabled {
-            println!("メモリリーク追跡は無効です ('leak on' で有効にしてください)");
+            println!("{}", t!("dbg.leak_disabled"));
             return;
         }
         if self.leak.live.is_empty() {
             println!(
-                "未解放のヒープ確保はありません (確保 {} 回, 解放 {} 回)",
-                self.leak.total_allocs, self.leak.total_frees
+                "{}",
+                t!("dbg.leak_none", allocs = self.leak.total_allocs, frees = self.leak.total_frees)
             );
         } else {
             let mut items: Vec<(&u64, &leak::LiveAlloc)> = self.leak.live.iter().collect();
             items.sort_by_key(|(addr, _)| **addr);
             let total: u64 = items.iter().map(|(_, a)| a.size).sum();
-            println!("未解放のヒープ確保: {} 件, 合計 {} バイト", items.len(), total);
+            println!("{}", t!("dbg.leak_summary", count = items.len(), total = total));
             for (addr, alloc) in items {
                 let call_addr = self.runtime_addr(alloc.call_site);
                 let loc = self
@@ -1108,11 +1129,20 @@ impl Debugger {
                     .lookup(alloc.call_site)
                     .map(|row| format!("{}:{}", row.file.display(), row.line))
                     .unwrap_or_else(|| format!("{:#x}", call_addr));
-                println!("  {:#018x}  {:>8} バイト  確保元: {} ({})", addr, alloc.size, alloc.func.name(), loc);
+                println!(
+                    "{}",
+                    t!(
+                        "dbg.leak_entry",
+                        addr = format!("{:#018x}", addr),
+                        size = alloc.size : {:>8},
+                        func = alloc.func.name(),
+                        loc = loc
+                    )
+                );
             }
         }
         if !self.leak.bad_frees.is_empty() {
-            println!("警告: 追跡外のポインタへの free (二重解放の可能性): {} 件", self.leak.bad_frees.len());
+            println!("{}", t!("dbg.leak_bad_frees_header", count = self.leak.bad_frees.len()));
             for p in &self.leak.bad_frees {
                 println!("  {:#018x}", p);
             }
@@ -1138,7 +1168,7 @@ impl Debugger {
             self.leak.warmed_up = true;
             if matches!(self.find_libc_mapping(), Ok(None)) {
                 if let Err(e) = self.warm_up_to_own_entry() {
-                    eprintln!("警告: メモリリーク追跡の準備実行に失敗しました: {}", e);
+                    eprintln!("{}", t!("dbg.leak_warmup_failed", err = e));
                 }
                 if !self.exited {
                     let _ = self.resolve_leak_entry_points();
@@ -1177,11 +1207,11 @@ impl Debugger {
         match waitpid(pid, None)? {
             WaitStatus::Exited(_, code) => {
                 self.mark_exited();
-                println!("[プロセスは終了しました (code={})]", code);
+                println!("{}", t!("dbg.process_exited", code = code));
             }
             WaitStatus::Signaled(_, sig, _) => {
                 self.mark_exited();
-                println!("[プロセスはシグナル {} で終了しました]", sig);
+                println!("{}", t!("dbg.process_signaled", sig = sig));
             }
             WaitStatus::Stopped(_, Signal::SIGTRAP) => {
                 let mut regs = registers::get_regs(pid)?;
@@ -1420,7 +1450,7 @@ impl Debugger {
                     println!("{}", line);
                 }
             }
-            Err(e) => eprintln!("警告: 逆アセンブル用のメモリ読み取りに失敗: {}", e),
+            Err(e) => eprintln!("{}", t!("dbg.disasm_read_failed", err = e)),
         }
     }
 
@@ -1445,7 +1475,7 @@ impl Debugger {
         }
         self.mark_exited();
         self.pid = None;
-        println!("プロセスを終了しました");
+        println!("{}", t!("dbg.process_killed"));
         Ok(())
     }
 
@@ -1457,7 +1487,7 @@ impl Debugger {
         println!("{}", registers::dump(&regs));
         match registers::get_fpregs(pid) {
             Ok(fpregs) => println!("{}", registers::dump_fpregs(&fpregs)),
-            Err(e) => eprintln!("警告: 浮動小数点レジスタの取得に失敗しました: {}", e),
+            Err(e) => eprintln!("{}", t!("dbg.fpregs_failed", err = e)),
         }
         Ok(())
     }
@@ -1476,7 +1506,7 @@ impl Debugger {
             return Ok(registers::xmm_low64(&fpregs, idx));
         }
         let regs = registers::get_regs(pid)?;
-        registers::get_by_name(&regs, name).ok_or_else(|| anyhow!("不明なレジスタ: {}", name))
+        registers::get_by_name(&regs, name).ok_or_else(|| anyhow!("{}", t!("dbg.unknown_register", name = name)))
     }
 
     /// `$<レジスタ名>` への `set` を行う。`st0`-`st7`/`xmm0`-`xmm15` は
@@ -1501,7 +1531,7 @@ impl Debugger {
         }
         let mut regs = registers::get_regs(pid)?;
         if !registers::set_by_name(&mut regs, name, value.as_i64() as u64) {
-            bail!("不明なレジスタ: {}", name);
+            bail!("{}", t!("dbg.unknown_register", name = name));
         }
         registers::set_regs(pid, &regs)
     }
@@ -1546,12 +1576,12 @@ impl Debugger {
 
     /// 現在の関数のローカル変数一覧を表示する (`show locals`)。
     pub fn list_locals(&self) -> Result<()> {
-        self.list_scope_vars(false, "ローカル変数はありません")
+        self.list_scope_vars(false, &t!("dbg.no_locals"))
     }
 
     /// 現在の関数の仮引数一覧を表示する (`show args`)。
     pub fn list_args(&self) -> Result<()> {
-        self.list_scope_vars(true, "仮引数はありません")
+        self.list_scope_vars(true, &t!("dbg.no_params"))
     }
 
     fn list_scope_vars(&self, want_params: bool, empty_msg: &str) -> Result<()> {
@@ -1559,7 +1589,7 @@ impl Debugger {
         let regs = registers::get_regs(pid)?;
         let link_pc = regs.rip.wrapping_sub(self.load_bias);
         let Some(sub) = self.dwarf.find_subprogram(link_pc) else {
-            println!("現在の PC の関数情報が見つかりません(デバッグ情報がないか、実行中の位置が不明です)");
+            println!("{}", t!("dbg.no_pc_function_info"));
             return Ok(());
         };
         let frame_base = self.eval_frame_base(&sub.frame_base, &regs)?;
@@ -1574,7 +1604,7 @@ impl Debugger {
                 .and_then(|addr| self.format_var_value(var, addr))
             {
                 Ok(s) => println!("{} = {}", var.name, s),
-                Err(e) => println!("{} = <エラー: {:#}>", var.name, e),
+                Err(e) => println!("{}", t!("dbg.var_error", name = &var.name, err = format!("{:#}", e))),
             }
         }
         if !any {
@@ -1589,7 +1619,7 @@ impl Debugger {
     pub fn list_globals(&self) -> Result<()> {
         let globals = self.dwarf.globals();
         if globals.is_empty() {
-            println!("グローバル変数はありません");
+            println!("{}", t!("dbg.no_globals"));
             return Ok(());
         }
         let pid = self.pid()?;
@@ -1602,7 +1632,7 @@ impl Debugger {
                 .and_then(|addr| self.format_var_value(var, addr))
             {
                 Ok(s) => println!("{} = {}", var.name, s),
-                Err(e) => println!("{} = <エラー: {:#}>", var.name, e),
+                Err(e) => println!("{}", t!("dbg.var_error", name = &var.name, err = format!("{:#}", e))),
             }
         }
         Ok(())
@@ -1790,7 +1820,7 @@ impl Debugger {
     /// の共通処理。
     fn resolve_member_chain(&self, base_name: &str, steps: &[expr::ChainStep]) -> Result<(u64, dwarf_info::TypeInfo)> {
         if steps.is_empty() {
-            bail!("'->' または '[]' の後に何もありません");
+            bail!("{}", t!("dbg.chain_empty"));
         }
         let (addr, var) = self.resolve_variable(base_name)?;
         // 先頭から暗黙のデリファレンスを1回済ませてしまわない: `[i]` は
@@ -1808,15 +1838,14 @@ impl Debugger {
                     let members = match &struct_ty {
                         dwarf_info::TypeInfo::Struct { members, .. } => members,
                         _ => bail!(
-                            "'{}' は構造体でもポインタでもないため、'->{}' を評価できません",
-                            cur_name,
-                            field
+                            "{}",
+                            t!("dbg.not_struct_or_pointer", name = cur_name, field = field)
                         ),
                     };
                     let m = members
                         .iter()
                         .find(|m| &m.name == field)
-                        .ok_or_else(|| anyhow!("メンバ '{}' が見つかりません", field))?;
+                        .ok_or_else(|| anyhow!("{}", t!("dbg.member_not_found", field = field)))?;
                     (struct_addr + m.offset, m.ty.clone())
                 }
                 expr::ChainStep::Index(idx) => {
@@ -1828,9 +1857,8 @@ impl Debugger {
                             (base, (**pointee).clone())
                         }
                         _ => bail!(
-                            "'{}' は配列でもポインタでもないため、'[{}]' を評価できません",
-                            cur_name,
-                            idx
+                            "{}",
+                            t!("dbg.not_array_or_pointer", name = cur_name, idx = idx)
                         ),
                     };
                     let elem_size = element_ty.byte_size().max(1);
@@ -1935,7 +1963,7 @@ impl Debugger {
             dwarf_info::TypeInfo::Struct { .. }
             | dwarf_info::TypeInfo::Array { .. }
             | dwarf_info::TypeInfo::Unknown => {
-                bail!("この型への書き込みには対応していません")
+                bail!("{}", t!("dbg.write_unsupported_type"))
             }
         }
     }
@@ -1945,9 +1973,10 @@ impl Debugger {
         let pid = self.pid()?;
         let regs = registers::get_regs(pid)?;
         let link_pc = regs.rip.wrapping_sub(self.load_bias);
-        let (sub, var) = self.dwarf.find_variable(link_pc, name).ok_or_else(|| {
-            anyhow!("変数 '{}' が見つかりません(現在のスコープ外か、デバッグ情報がありません)", name)
-        })?;
+        let (sub, var) = self
+            .dwarf
+            .find_variable(link_pc, name)
+            .ok_or_else(|| anyhow!("{}", t!("dbg.var_not_found", name = name)))?;
         let frame_base = self.eval_frame_base(&sub.frame_base, &regs)?;
         let addr = self.eval_location(&var.location, frame_base, &regs)?;
         Ok((addr, var.clone()))
@@ -1959,17 +1988,17 @@ impl Debugger {
     /// (`backtrace`/`up` の rbp チェイン前提と同じ簡略化)。
     fn eval_frame_base(&self, expr: &[u8], regs: &registers::Regs) -> Result<u64> {
         if expr.is_empty() {
-            bail!("frame_base 情報がありません");
+            bail!("{}", t!("dbg.no_frame_base"));
         }
         match expr[0] {
             0x9c => Ok(regs.rbp.wrapping_add(16)),
             op @ 0x70..=0x8f => {
                 let offset = dwarf_info::read_sleb128(&expr[1..])
-                    .ok_or_else(|| anyhow!("frame_base の DWARF 式を解析できません"))?;
+                    .ok_or_else(|| anyhow!("{}", t!("dbg.frame_base_parse_failed")))?;
                 let reg_val = self.dwarf_reg_value(op - 0x70, regs)?;
                 Ok((reg_val as i64).wrapping_add(offset) as u64)
             }
-            op => bail!("対応していない frame_base 式です (opcode {:#x})", op),
+            op => bail!("{}", t!("dbg.unsupported_frame_base_expr", op = format!("{:#x}", op))),
         }
     }
 
@@ -1978,28 +2007,28 @@ impl Debugger {
     /// 変数用)、`DW_OP_bregN`(レジスタ相対)に対応する。
     fn eval_location(&self, expr: &[u8], frame_base: u64, regs: &registers::Regs) -> Result<u64> {
         if expr.is_empty() {
-            bail!("変数の位置情報がありません");
+            bail!("{}", t!("dbg.no_var_location"));
         }
         match expr[0] {
             0x91 => {
                 let offset = dwarf_info::read_sleb128(&expr[1..])
-                    .ok_or_else(|| anyhow!("変数の DWARF 式を解析できません"))?;
+                    .ok_or_else(|| anyhow!("{}", t!("dbg.var_expr_parse_failed")))?;
                 Ok((frame_base as i64).wrapping_add(offset) as u64)
             }
             0x03 => {
                 if expr.len() < 9 {
-                    bail!("DW_OP_addr のオペランドが不足しています");
+                    bail!("{}", t!("dbg.dw_op_addr_missing_operand"));
                 }
                 let addr = u64::from_le_bytes(expr[1..9].try_into().unwrap());
                 Ok(self.runtime_addr(addr))
             }
             op @ 0x70..=0x8f => {
                 let offset = dwarf_info::read_sleb128(&expr[1..])
-                    .ok_or_else(|| anyhow!("変数の DWARF 式を解析できません"))?;
+                    .ok_or_else(|| anyhow!("{}", t!("dbg.var_expr_parse_failed")))?;
                 let reg_val = self.dwarf_reg_value(op - 0x70, regs)?;
                 Ok((reg_val as i64).wrapping_add(offset) as u64)
             }
-            op => bail!("対応していない変数位置式です (opcode {:#x})", op),
+            op => bail!("{}", t!("dbg.unsupported_var_location_expr", op = format!("{:#x}", op))),
         }
     }
 
@@ -2023,9 +2052,9 @@ impl Debugger {
             14 => "r14",
             15 => "r15",
             16 => "rip",
-            other => bail!("対応していない DWARF レジスタ番号です: {}", other),
+            other => bail!("{}", t!("dbg.unsupported_dwarf_reg", other = other)),
         };
-        registers::get_by_name(regs, name).ok_or_else(|| anyhow!("レジスタ '{}' の取得に失敗しました", name))
+        registers::get_by_name(regs, name).ok_or_else(|| anyhow!("{}", t!("dbg.reg_get_failed", name = name)))
     }
 
     pub fn read_mem(&self, addr: u64, len: usize) -> Result<Vec<u8>> {
@@ -2034,7 +2063,7 @@ impl Debugger {
         let mut cur = addr & !0x7;
         let start_pad = (addr - cur) as usize;
         while out.len() < start_pad + len {
-            let word = ptrace::read(pid, cur as *mut c_void).context("メモリ読み取りに失敗")?;
+            let word = ptrace::read(pid, cur as *mut c_void).context(t!("dbg.mem_read_failed").to_string())?;
             out.extend_from_slice(&word.to_ne_bytes());
             cur += 8;
         }
@@ -2048,14 +2077,14 @@ impl Debugger {
         while offset < data.len() {
             let word_addr = cur & !0x7;
             let mut word = ptrace::read(pid, word_addr as *mut c_void)
-                .context("メモリ読み取りに失敗")?
+                .context(t!("dbg.mem_read_failed").to_string())?
                 .to_ne_bytes();
             let in_word_off = (cur - word_addr) as usize;
             let n = (8 - in_word_off).min(data.len() - offset);
             word[in_word_off..in_word_off + n].copy_from_slice(&data[offset..offset + n]);
             let new_word = i64::from_ne_bytes(word);
             ptrace::write(pid, word_addr as *mut c_void, new_word)
-                .context("メモリ書き込みに失敗")?;
+                .context(t!("dbg.mem_write_failed").to_string())?;
             cur += n as u64;
             offset += n;
         }
@@ -2105,7 +2134,7 @@ impl Debugger {
         let symbols: Vec<&Symbol> =
             self.elf.symbols.iter().filter(|s| filter.is_none_or(|f| s.name.contains(f))).collect();
         if symbols.is_empty() {
-            println!("シンボルが見つかりません");
+            println!("{}", t!("dbg.no_symbols"));
             return;
         }
         for s in symbols {
@@ -2135,7 +2164,7 @@ impl Debugger {
             println!("{:#018x} {}:{}", addr, row.file.display(), row.line);
         }
         if !any {
-            println!("行番号情報が見つかりません(DWARF情報が無いか、指定した関数が見つかりません)");
+            println!("{}", t!("dbg.no_lineinfo"));
         }
     }
 
@@ -2164,10 +2193,10 @@ impl Debugger {
                     let n: u32 = line_part
                         .trim()
                         .parse()
-                        .with_context(|| format!("行番号の解析に失敗しました: '{}'", line_part))?;
+                        .with_context(|| t!("dbg.line_parse_failed", s = line_part).to_string())?;
                     let file = self
                         .resolve_source_file(file_part.trim())
-                        .ok_or_else(|| anyhow!("ファイル '{}' の行番号情報が見つかりません", file_part))?;
+                        .ok_or_else(|| anyhow!("{}", t!("dbg.file_lineinfo_not_found", file = file_part)))?;
                     (file, n)
                 } else {
                     self.location_from_function(s)?
@@ -2193,11 +2222,11 @@ impl Debugger {
         let sym = self
             .elf
             .find_by_name("main")
-            .ok_or_else(|| anyhow!("表示位置を特定できません。関数名か 'ファイル:行番号' を指定してください"))?;
+            .ok_or_else(|| anyhow!("{}", t!("dbg.list_no_location")))?;
         let row = self
             .dwarf
             .lookup(sym.addr)
-            .ok_or_else(|| anyhow!("表示位置を特定できません(DWARF情報がありません)"))?;
+            .ok_or_else(|| anyhow!("{}", t!("dbg.list_no_location_no_dwarf")))?;
         Ok((row.file.clone(), row.line))
     }
 
@@ -2210,18 +2239,19 @@ impl Debugger {
         let row = self
             .dwarf
             .lookup(link_addr)
-            .ok_or_else(|| anyhow!("アドレス {:#x} に対応する行番号情報が見つかりません", addr))?;
+            .ok_or_else(|| anyhow!("{}", t!("dbg.addr_lineinfo_not_found", addr = format!("{:#x}", addr))))?;
         Ok((row.file.clone(), row.line))
     }
 
     /// 関数名に対応する(ファイル, 行番号)を求める。ELF シンボルテーブルで
     /// アドレスを引き、そのアドレスの行番号情報を DWARF から引く。
     fn location_from_function(&self, name: &str) -> Result<(PathBuf, u32)> {
-        let sym = self.elf.find_by_name(name).ok_or_else(|| anyhow!("関数 '{}' が見つかりません", name))?;
+        let sym =
+            self.elf.find_by_name(name).ok_or_else(|| anyhow!("{}", t!("dbg.function_not_found", name = name)))?;
         let row = self
             .dwarf
             .lookup(sym.addr)
-            .ok_or_else(|| anyhow!("関数 '{}' の行番号情報が見つかりません(DWARF情報がありません)", name))?;
+            .ok_or_else(|| anyhow!("{}", t!("dbg.function_lineinfo_not_found", name = name)))?;
         Ok((row.file.clone(), row.line))
     }
 
@@ -2248,7 +2278,7 @@ impl Debugger {
         let start = center_line.saturating_sub(WINDOW / 2 - 1).max(1);
         let end = start + WINDOW - 1;
         let Ok(content) = fs::read_to_string(file) else {
-            println!("ソースファイル '{}' を開けません", file.display());
+            println!("{}", t!("dbg.source_open_failed", path = file.display()));
             return;
         };
         println!("{}:", file.display());
@@ -2265,7 +2295,7 @@ impl Debugger {
             any = true;
         }
         if !any {
-            println!("(指定した行番号の範囲にソースがありません)");
+            println!("{}", t!("dbg.no_source_in_range"));
         }
     }
 
@@ -2308,7 +2338,7 @@ fn read_source_line(path: &Path, line: u32) -> Option<String> {
 fn parse_addr(s: &str) -> Result<u64> {
     let s = s.trim();
     let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
-    u64::from_str_radix(s, 16).context("アドレスの解析に失敗しました (16進数を指定してください)")
+    u64::from_str_radix(s, 16).context(t!("dbg.addr_parse_failed").to_string())
 }
 
 /// 1/2/4/8バイトの生バイト列(リトルエンディアン)を `u64` へゼロ拡張する。

@@ -1,66 +1,13 @@
 use crate::debugger::Debugger;
 use crate::expr;
+use rust_i18n::t;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
-const HELP: &str = "\
-使用可能なコマンド:
-  run, r                    プログラムを起動する
-  break <func>, b <func>    関数名にブレークポイントを設定
-  break <ファイル>:<行番号>  ソースコードのファイル名:行番号にブレークポイントを設定(DWARF情報が必要)
-  break *<addr>             アドレス(16進)にブレークポイントを設定
-  info breakpoints, i b     ブレークポイント一覧を表示
-  watch <変数名>             変数への書き込みでハードウェアウォッチポイントを設定(DWARF情報が必要)
-  watch *<addr式> [長さ]     アドレスへの書き込みでウォッチポイントを設定(長さ省略時8バイト)
-  info watchpoints, i w     ウォッチポイント一覧を表示
-  delete <n>, d <n>         ブレークポイント/ウォッチポイント n を削除
-  continue, c               実行を再開する
-  stepi, si                 機械語命令を1つ実行する
-  nexti, ni                 call をまたいで機械語命令を1つ実行する
-  step, s                   ソース行単位でステップイン実行する(DWARF情報が必要)
-  next, n                   ソース行単位でステップオーバー実行する(DWARF情報が必要)
-  up                        現在の関数の呼び出し元へ戻るまで実行する
-  backtrace, bt             コールスタックを表示する
-  syms [絞り込み文字列]      ELFのシンボル(関数)一覧を表示する
-  lines [関数名]             行番号情報(アドレス・ファイル・行番号)を表示する(DWARF情報が必要)
-  list, l                   ソースコードを表示する(現在位置、無ければ main を中心に10行)
-  list <関数名>              その関数の先頭を中心にソースコードを表示する(DWARF情報が必要)
-  list <行番号>              現在位置(または main)と同じファイルのその行を中心に表示する
-  list <ファイル>:<行番号>    指定ファイルのその行を中心に表示する(DWARF情報が必要)
-  list *<addr>              アドレス(16進、実行中はランタイムアドレス)に対応する行を表示する
-  info registers, i r       全レジスタを表示する(汎用・rip・eflags・orig_rax・セグメント・
-                              fs_base/gs_base・x87 st0-st7・SSE xmm0-xmm15・mxcsr)
-  print <式>, p <式>        式を評価して表示する (例: p $rax, p x+1, p *$rsp,
-                              p &x, p ptr->field, p ptr.field, p arr, p arr[0],
-                              p arr[0]->x)
-  print/fmt <式>            フォーマット指定して表示する (fmt: x=16進 o=8進
-                              t=2進 d/i=10進 c=文字 s=文字列, 例: p/x $rax)
-  set $<reg>=<式>           レジスタに式の評価値を設定する(st0-st7は浮動小数点数として、
-                              xmm0-xmm15は下位64bit整数として扱う)
-  set <変数名>=<式>         ローカル変数/仮引数に式の評価値を設定する(DWARF情報が必要)
-  set <変数名>-><メンバ>=<式>  構造体メンバに式の評価値を設定する(->と.は同じ意味、DWARF情報が必要)
-  set <変数名>[<添字>]=<式>    配列/ポインタの要素に式の評価値を設定する(DWARF情報が必要)
-  set print pretty on|off   構造体を複数行インデント表示するか(既定 off)
-  set print elements <n>|unlimited
-                            文字列(/s)/構造体表示の要素数上限(既定 200)
-  show print                現在の print pretty/elements 設定を表示する
-  show locals               現在の関数のローカル変数一覧を表示する(DWARF情報が必要)
-  show args                 現在の関数の仮引数一覧を表示する(DWARF情報が必要)
-  show globals               グローバル変数の一覧を表示する(DWARF情報が必要)
-  x/<n> <addr>              メモリをバイト列として表示する
-  set *<addr式>=<式>        メモリを1バイト書き換える (例: set *0x4011a0=0x90)
-  leak on|off               メモリリーク追跡(malloc/calloc/realloc/free)を有効/無効化する
-  leak                      メモリリーク追跡の状態(on/off・確保/解放回数)を表示する
-  leaks                     未解放のヒープ確保一覧を表示する(leak on かつ continue 実行が必要)
-  kill, k                   実行中のプロセスを終了する
-  help, h, ?                このヘルプを表示する
-  quit, q                   デバッガを終了する
-";
-
 pub fn run_repl(mut dbg: Debugger) {
     let mut rl = DefaultEditor::new().expect("failed to init line editor");
-    println!("tdb -- 簡易 Linux/C デバッガ (対象: {})", dbg.program_path().display());
-    println!("'help' でコマンド一覧を表示します。");
+    println!("{}", t!("repl.banner", path = dbg.program_path().display()));
+    println!("{}", t!("repl.banner_hint"));
 
     loop {
         let readline = rl.readline("(tdb) ");
@@ -76,12 +23,12 @@ pub fn run_repl(mut dbg: Debugger) {
                 }
             }
             Err(ReadlineError::Interrupted) => {
-                println!("(Ctrl-C: 'quit' で終了)");
+                println!("{}", t!("repl.ctrl_c_hint"));
                 continue;
             }
             Err(ReadlineError::Eof) => break,
             Err(e) => {
-                eprintln!("入力エラー: {}", e);
+                eprintln!("{}", t!("repl.input_error", err = e));
                 break;
             }
         }
@@ -99,7 +46,7 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
         "break" | "b" => match rest.first() {
             Some(spec) => dbg.break_at_spec(spec),
             None => {
-                println!("使い方: break <func> | break <ファイル>:<行番号> | break *<addr>");
+                println!("{}", t!("repl.usage_break"));
                 Ok(())
             }
         },
@@ -114,7 +61,7 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
             }
             Some("registers") | Some("r") => dbg.print_regs(),
             _ => {
-                println!("使い方: info breakpoints | info watchpoints | info registers");
+                println!("{}", t!("repl.usage_info"));
                 Ok(())
             }
         },
@@ -122,7 +69,7 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
         "delete" | "d" => match rest.first().and_then(|s| s.parse::<u32>().ok()) {
             Some(id) => dbg.delete_breakpoint(id),
             None => {
-                println!("使い方: delete <番号> (ブレークポイント/ウォッチポイント共通の番号)");
+                println!("{}", t!("repl.usage_delete"));
                 Ok(())
             }
         },
@@ -156,7 +103,7 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
                 Ok(())
             }
             Some(other) => {
-                println!("不明な引数: '{}' (使い方: leak on | leak off | leak)", other);
+                println!("{}", t!("repl.leak_unknown_arg", arg = other));
                 Ok(())
             }
         },
@@ -180,7 +127,7 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
             Some("args") => dbg.list_args(),
             Some("globals") => dbg.list_globals(),
             _ => {
-                println!("使い方: show print | show locals | show args | show globals");
+                println!("{}", t!("repl.usage_show"));
                 Ok(())
             }
         },
@@ -188,13 +135,28 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
             Some("print") => handle_set_print(dbg, &rest[1..]),
             Some(assign) => handle_set(dbg, assign, &rest[1..]),
             None => {
-                println!("使い方: set $<レジスタ名>=<値> | set print ...");
+                println!("{}", t!("repl.usage_set"));
                 Ok(())
             }
         },
         "kill" | "k" => dbg.kill(),
         "help" | "h" | "?" => {
-            print!("{}", HELP);
+            print!("{}", t!("help"));
+            Ok(())
+        }
+        "lang" => {
+            match rest.first().copied() {
+                Some(l @ ("en" | "ja")) => {
+                    rust_i18n::set_locale(l);
+                    println!("{}", t!("repl.lang_switched", lang = l));
+                }
+                Some(other) => {
+                    println!("{}", t!("repl.lang_unknown", arg = other));
+                }
+                None => {
+                    println!("{}", t!("repl.lang_current", lang = &*rust_i18n::locale()));
+                }
+            }
             Ok(())
         }
         "quit" | "q" | "exit" => {
@@ -207,18 +169,18 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
             if !rest.is_empty() {
                 handle_examine(dbg, other, &rest)
             } else {
-                println!("使い方: x/<バイト数> <アドレス>");
+                println!("{}", t!("repl.usage_examine_bytes"));
                 Ok(())
             }
         }
         other => {
-            println!("不明なコマンド: '{}' ('help' を参照)", other);
+            println!("{}", t!("repl.unknown_command", cmd = other));
             Ok(())
         }
     };
 
     if let Err(e) = result {
-        println!("エラー: {:#}", e);
+        println!("{}", t!("repl.error_prefix", err = format!("{:#}", e)));
     }
     true
 }
@@ -237,9 +199,7 @@ fn handle_print(dbg: &mut Debugger, fmt: Option<&str>, rest: &[&str]) -> anyhow:
     };
 
     if expr_toks.is_empty() {
-        println!(
-            "使い方: print[/fmt] <式> (fmt: x=16進 o=8進 t=2進 d/i=10進 c=文字 s=文字列, 例: p/x $rax)"
-        );
+        println!("{}", t!("repl.usage_print"));
         return Ok(());
     }
     let text = expr_toks.join(" ");
@@ -265,7 +225,7 @@ fn handle_print(dbg: &mut Debugger, fmt: Option<&str>, rest: &[&str]) -> anyhow:
         Some(f) => {
             let value = match result {
                 expr::PrintResult::Text(_) => {
-                    anyhow::bail!("構造体/配列にはフォーマット指定 (/{}) は使えません", f)
+                    anyhow::bail!("{}", t!("repl.fmt_struct_unsupported", f = f))
                 }
                 expr::PrintResult::Value(v, _) => v,
             };
@@ -286,7 +246,7 @@ fn handle_print(dbg: &mut Debugger, fmt: Option<&str>, rest: &[&str]) -> anyhow:
                     let s = read_c_string(dbg, i as u64)?;
                     println!("{} = \"{}\"", text, s);
                 }
-                other => anyhow::bail!("不明なフォーマット指定です: /{} (x, o, t, d, i, c, s が使えます)", other),
+                other => anyhow::bail!("{}", t!("repl.fmt_unknown", other = other)),
             }
         }
     }
@@ -342,14 +302,13 @@ fn handle_set_print(dbg: &mut Debugger, rest: &[&str]) -> anyhow::Result<()> {
             Ok(())
         }
         ["elements", n] => {
-            let n: usize = n
-                .parse()
-                .map_err(|_| anyhow::anyhow!("使い方: set print elements <数値>|unlimited"))?;
+            let n: usize =
+                n.parse().map_err(|_| anyhow::anyhow!("{}", t!("repl.usage_set_print_elements")))?;
             dbg.set_print_elements(Some(n));
             Ok(())
         }
         _ => {
-            println!("使い方: set print pretty on|off | set print elements <数値>|unlimited");
+            println!("{}", t!("repl.usage_set_print"));
             Ok(())
         }
     }
@@ -362,13 +321,8 @@ fn handle_set(dbg: &mut Debugger, first_tok: &str, rest_toks: &[&str]) -> anyhow
     } else {
         format!("{} {}", first_tok, rest_toks.join(" "))
     };
-    let (target, val_expr) = full
-        .split_once('=')
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "使い方: set $<レジスタ名>=<式> | set *<addr式>=<式> | set <変数名>=<式> | set <変数名>-><メンバ名>=<式> | set <変数名>.<メンバ名>=<式> | set <変数名>[<添字>]=<式>"
-            )
-        })?;
+    let (target, val_expr) =
+        full.split_once('=').ok_or_else(|| anyhow::anyhow!("{}", t!("repl.usage_set_full")))?;
     let target = target.trim();
     let value = expr::eval(val_expr.trim(), dbg)?;
 
@@ -396,13 +350,13 @@ fn handle_set(dbg: &mut Debugger, first_tok: &str, rest_toks: &[&str]) -> anyhow
 /// 8バイト)。どちらもハードウェアウォッチポイント(書き込み監視、
 /// 1/2/4/8バイトのいずれか)として設置する。
 fn handle_watch(dbg: &mut Debugger, rest: &[&str]) -> anyhow::Result<()> {
-    let target = rest
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("使い方: watch <変数名> | watch *<addr式> [長さ(1/2/4/8, 既定8)]"))?;
+    let target = rest.first().ok_or_else(|| anyhow::anyhow!("{}", t!("repl.usage_watch")))?;
     if let Some(addr_expr) = target.strip_prefix('*') {
         let addr = expr::eval(addr_expr, dbg)?.as_i64() as u64;
         let len: u8 = match rest.get(1) {
-            Some(s) => s.parse().map_err(|_| anyhow::anyhow!("長さの解析に失敗しました: '{}'", s))?,
+            Some(s) => {
+                s.parse().map_err(|_| anyhow::anyhow!("{}", t!("repl.watch_len_parse_failed", s = s)))?
+            }
             None => 8,
         };
         return dbg.add_watchpoint(addr, len, format!("*{:#x}", addr));
@@ -417,7 +371,7 @@ fn handle_examine(dbg: &Debugger, cmd: &str, rest: &[&str]) -> anyhow::Result<()
         .and_then(|(_, n)| n.parse().ok())
         .or_else(|| rest.first().and_then(|s| s.strip_prefix('/')).and_then(|n| n.parse().ok()))
         .unwrap_or(16);
-    let addr_str = rest.last().ok_or_else(|| anyhow::anyhow!("使い方: x/<n> <addr>"))?;
+    let addr_str = rest.last().ok_or_else(|| anyhow::anyhow!("{}", t!("repl.usage_examine_n")))?;
     let addr = if let Some(reg) = addr_str.strip_prefix('$') {
         dbg.get_reg(reg)?
     } else {
