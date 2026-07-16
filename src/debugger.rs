@@ -262,8 +262,7 @@ impl Debugger {
     pub fn break_at_spec(&mut self, spec: &str) -> Result<()> {
         if let Some(hex) = spec.strip_prefix('*') {
             let addr = parse_addr(hex)?;
-            self.install_breakpoint(addr, format!("*{:#x}", addr));
-            return Ok(());
+            return self.install_breakpoint(addr, format!("*{:#x}", addr));
         }
         if !self.is_running() {
             self.pending_breaks.push(spec.to_string());
@@ -294,8 +293,7 @@ impl Debugger {
             .clone();
         let entry_addr = self.runtime_addr(sym.addr);
         let addr = self.skip_prologue_addr(&sym, entry_addr);
-        self.install_breakpoint(addr, name.to_string());
-        Ok(())
+        self.install_breakpoint(addr, name.to_string())
     }
 
     /// `ファイル名:行番号` にブレークポイントを設置する。指定行に実行可能な
@@ -304,8 +302,7 @@ impl Debugger {
     fn install_breakpoint_by_location(&mut self, file_part: &str, line: u32) -> Result<()> {
         let (link_addr, file, actual_line) = self.resolve_file_line(file_part, line)?;
         let addr = self.runtime_addr(link_addr);
-        self.install_breakpoint(addr, format!("{}:{}", file.display(), actual_line));
-        Ok(())
+        self.install_breakpoint(addr, format!("{}:{}", file.display(), actual_line))
     }
 
     /// `file_part`(フルパス・ファイル名・パスの末尾部分一致のいずれか、
@@ -360,7 +357,16 @@ impl Debugger {
         }
     }
 
-    fn install_breakpoint(&mut self, addr: u64, label: String) {
+    /// 同じアドレスに2つ以上のブレークポイントを設定できないようにする
+    /// (`self.breakpoints` は既にアドレスをキーにしているため、1アドレス
+    /// につき1つの実体しか持てない。ここで事前にはじくことで、既存の
+    /// ブレークポイントが黙って上書きされたり、`bp_ids` に同じアドレスを
+    /// 指す番号が複数できたりするのを防ぐ)。
+    fn install_breakpoint(&mut self, addr: u64, label: String) -> Result<()> {
+        if self.breakpoints.contains_key(&addr) {
+            let existing_id = self.bp_ids.iter().find(|(_, &a)| a == addr).map(|(&id, _)| id).unwrap_or(0);
+            bail!("{}", t!("dbg.bp_addr_in_use", addr = format!("{:#x}", addr), id = existing_id));
+        }
         let id = self.next_bp_id;
         self.next_bp_id += 1;
         self.bp_ids.insert(id, addr);
@@ -374,6 +380,7 @@ impl Debugger {
         }
         self.breakpoints.insert(addr, bp);
         println!("{}", t!("dbg.bp_set", id = id, label = label, addr = format!("{:#x}", addr)));
+        Ok(())
     }
 
     pub fn list_breakpoints(&self) {

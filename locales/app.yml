@@ -272,6 +272,9 @@ dbg.process_started:
 dbg.bp_set:
   ja: "ブレークポイント %{id} を %{label} (%{addr}) に設定しました"
   en: "Breakpoint %{id} set at %{label} (%{addr})"
+dbg.bp_addr_in_use:
+  ja: "アドレス %{addr} には既にブレークポイント %{id} が設定されています"
+  en: "Breakpoint %{id} already exists at address %{addr}"
 dbg.no_breakpoints:
   ja: "ブレークポイントは設定されていません"
   en: "No breakpoints are set"
