@@ -12,6 +12,12 @@ help:
       watch *<addr式> [長さ]     アドレスへの書き込みでウォッチポイントを設定(長さ省略時8バイト)
       info watchpoints, i w     ウォッチポイント一覧を表示
       delete <n>, d <n>         ブレークポイント/ウォッチポイント n を削除
+      info threads, i t        実行中のスレッド一覧を表示する(現在のスレッドに * が付く、lock 中は [ロック中])
+      thread <n>                フォーカスするスレッドを切り替える(print/step/backtrace等が対象にする、
+                                  <n> は info threads の番号または括弧内の tid のどちらでも可)
+      lock <n>                  スレッド n だけを実行させ、他のスレッドを停止させる(GDBの scheduler-locking 相当、
+                                  <n> は info threads の番号または括弧内の tid のどちらでも可)
+      unlock                    lock によるスレッド実行制限を解除し、他のスレッドも再開する
       continue, c               実行を再開する
       stepi, si                 機械語命令を1つ実行する
       nexti, ni                 call をまたいで機械語命令を1つ実行する
@@ -50,7 +56,7 @@ help:
       leak on|off               メモリリーク追跡(malloc/calloc/realloc/free)を有効/無効化する
       leak                      メモリリーク追跡の状態(on/off・確保/解放回数)を表示する
       leaks                     未解放のヒープ確保一覧を表示する(leak on かつ continue 実行が必要)
-      lang <en|ja>              表示言語を切り替える(今のところ、このヘルプの表示のみに影響)
+      lang <en|ja>              表示言語を切り替える(全てのメッセージが対象)
       kill, k                   実行中のプロセスを終了する
       help, h, ?                このヘルプを表示する
       quit, q                   デバッガを終了する
@@ -65,6 +71,12 @@ help:
       watch *<addr-expr> [len]  Set a watchpoint on writes to an address (default length: 8 bytes)
       info watchpoints, i w     List watchpoints
       delete <n>, d <n>         Delete breakpoint/watchpoint n
+      info threads, i t        List running threads (current thread marked with *, [locked] while lock is active)
+      thread <n>                Switch the focused thread (print/step/backtrace etc. target it;
+                                  <n> can be either the info threads number or the tid shown in parentheses)
+      lock <n>                  Run only thread n, holding all other threads stopped (like GDB's scheduler-locking;
+                                  <n> can be either the info threads number or the tid shown in parentheses)
+      unlock                    Release the lock set by `lock`, resuming other threads
       continue, c               Resume execution
       stepi, si                 Execute one machine instruction
       nexti, ni                 Execute one machine instruction, stepping over calls
@@ -104,7 +116,7 @@ help:
       leak on|off               Enable/disable heap leak tracking (malloc/calloc/realloc/free)
       leak                      Show leak-tracking status (on/off, alloc/free counts)
       leaks                     List unfreed heap allocations (requires leak on and a continue)
-      lang <en|ja>              Switch the UI language (currently affects only this help text)
+      lang <en|ja>              Switch the UI language (affects all messages)
       kill, k                   Kill the running process
       help, h, ?                Show this help
       quit, q                   Quit the debugger
@@ -175,8 +187,14 @@ repl.usage_break:
   ja: "使い方: break <func> | break <ファイル>:<行番号> | break *<addr>"
   en: "Usage: break <func> | break <file>:<line> | break *<addr>"
 repl.usage_info:
-  ja: "使い方: info breakpoints | info watchpoints | info registers"
-  en: "Usage: info breakpoints | info watchpoints | info registers"
+  ja: "使い方: info breakpoints | info watchpoints | info threads | info registers"
+  en: "Usage: info breakpoints | info watchpoints | info threads | info registers"
+repl.usage_thread:
+  ja: "使い方: thread <スレッド番号>"
+  en: "Usage: thread <thread-number>"
+repl.usage_lock:
+  ja: "使い方: lock <スレッド番号>"
+  en: "Usage: lock <thread-number>"
 repl.usage_delete:
   ja: "使い方: delete <番号> (ブレークポイント/ウォッチポイント共通の番号)"
   en: "Usage: delete <number> (shared numbering for breakpoints/watchpoints)"
@@ -278,6 +296,30 @@ dbg.bp_addr_in_use:
 dbg.no_breakpoints:
   ja: "ブレークポイントは設定されていません"
   en: "No breakpoints are set"
+dbg.thread_not_found:
+  ja: "スレッド %{id} は存在しません"
+  en: "Thread %{id} does not exist"
+dbg.thread_not_stopped:
+  ja: "スレッド %{id} は現在停止していません(バックグラウンドで実行中のため切り替えできません)"
+  en: "Thread %{id} is not currently stopped (it is running in the background, so it cannot be selected)"
+dbg.thread_switched:
+  ja: "スレッド %{id} (tid %{tid}) に切り替えました"
+  en: "Switched to thread %{id} (tid %{tid})"
+dbg.thread_locked:
+  ja: "スレッド %{id} (tid %{tid}) をロックしました。以後 continue/step はこのスレッドのみを実行します(unlock で解除)"
+  en: "Locked to thread %{id} (tid %{tid}). Only this thread will run on continue/step (use unlock to release)"
+dbg.thread_unlocked:
+  ja: "スレッドロックを解除しました。他のスレッドも再開します"
+  en: "Thread lock released; other threads will resume"
+dbg.thread_not_locked:
+  ja: "現在ロックされているスレッドはありません"
+  en: "No thread is currently locked"
+dbg.thread_list_locked_tag:
+  ja: "[ロック中]"
+  en: "[locked]"
+dbg.thread_locked_cannot_switch:
+  ja: "スレッドがロックされているため切り替えできません(先に unlock してください)"
+  en: "Cannot switch threads while a thread lock is active (run unlock first)"
 dbg.bp_inactive:
   ja: "(未実行)"
   en: "(inactive)"

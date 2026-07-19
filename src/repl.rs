@@ -59,12 +59,28 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
                 dbg.list_watchpoints();
                 Ok(())
             }
+            Some("threads") | Some("t") => dbg.list_threads(),
             Some("registers") | Some("r") => dbg.print_regs(),
             _ => {
                 println!("{}", t!("repl.usage_info"));
                 Ok(())
             }
         },
+        "thread" => match rest.first().and_then(|s| s.parse::<u32>().ok()) {
+            Some(id) => dbg.switch_thread(id),
+            None => {
+                println!("{}", t!("repl.usage_thread"));
+                Ok(())
+            }
+        },
+        "lock" => match rest.first().and_then(|s| s.parse::<u32>().ok()) {
+            Some(id) => dbg.lock_thread(id),
+            None => {
+                println!("{}", t!("repl.usage_lock"));
+                Ok(())
+            }
+        },
+        "unlock" => dbg.unlock_thread(),
         "watch" => handle_watch(dbg, &rest),
         "delete" | "d" => match rest.first().and_then(|s| s.parse::<u32>().ok()) {
             Some(id) => dbg.delete_breakpoint(id),
