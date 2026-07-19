@@ -1116,9 +1116,8 @@ impl Debugger {
                     let link_ip = rip.wrapping_sub(self.load_bias);
                     match self.dwarf.lookup(link_ip) {
                         Some(row) if row.is_stmt && Some((row.file.clone(), row.line)) != start_line => {
-                            println!("{}:{}", row.file.display(), row.line);
-                            if let Some(text) = read_source_line(&row.file, row.line) {
-                                println!("{:>4}\t{}", row.line, text);
+                            if !self.print_source_context(&row.file, row.line) {
+                                println!("{}:{}", row.file.display(), row.line);
                             }
                             return Ok(());
                         }
@@ -1193,9 +1192,8 @@ impl Debugger {
                     let link_ip = rip.wrapping_sub(self.load_bias);
                     match self.dwarf.lookup(link_ip) {
                         Some(row) if row.is_stmt && Some((row.file.clone(), row.line)) != start_line => {
-                            println!("{}:{}", row.file.display(), row.line);
-                            if let Some(text) = read_source_line(&row.file, row.line) {
-                                println!("{:>4}\t{}", row.line, text);
+                            if !self.print_source_context(&row.file, row.line) {
+                                println!("{}:{}", row.file.display(), row.line);
                             }
                             return Ok(());
                         }
@@ -1789,14 +1787,38 @@ impl Debugger {
         Ok(())
     }
 
+    /// `center_line` を中心に前後3行(計最大7行)のソースコードを表示する。
+    /// 現在行の行番号の前に `>` の印を付ける。ファイルが読めない、または
+    /// 指定行が範囲外で1行も表示できない場合は何も表示せず `false` を返す
+    /// (呼び出し側で逆アセンブル表示にフォールバックする)。
+    fn print_source_context(&self, file: &Path, center_line: u32) -> bool {
+        const CONTEXT: u32 = 3;
+        let Ok(content) = fs::read_to_string(file) else {
+            return false;
+        };
+        let center_line = center_line.max(1);
+        let start = center_line.saturating_sub(CONTEXT).max(1);
+        let end = center_line + CONTEXT;
+        let lines: Vec<(u32, &str)> =
+            content.lines().enumerate().map(|(i, t)| ((i + 1) as u32, t)).filter(|(n, _)| *n >= start && *n <= end).collect();
+        if lines.is_empty() {
+            return false;
+        }
+        println!("{}:{}", file.display(), center_line);
+        for (n, text) in lines {
+            let marker = if n == center_line { '>' } else { ' ' };
+            println!("{}{:>4}\t{}", marker, n, text);
+        }
+        true
+    }
+
     /// 停止アドレスの内容を表示する。DWARF 行情報からソースファイル/行が
-    /// 分かればそのソース行を、分からなければ逆アセンブル結果を表示する。
+    /// 分かればその周辺行(現在行の前後3行、計最大7行)を、分からなければ
+    /// 逆アセンブル結果を表示する。
     fn show_stop_location(&self, addr: u64) {
         let link_addr = addr.wrapping_sub(self.load_bias);
         if let Some(row) = self.dwarf.lookup(link_addr) {
-            if let Some(text) = read_source_line(&row.file, row.line) {
-                println!("{}:{}", row.file.display(), row.line);
-                println!("{:>4}\t{}", row.line, text);
+            if self.print_source_context(&row.file, row.line) {
                 return;
             }
         }
@@ -2707,14 +2729,6 @@ fn load_dynamic_symbols(path: &Path) -> Result<HashMap<String, u64>> {
         }
     }
     Ok(map)
-}
-
-fn read_source_line(path: &Path, line: u32) -> Option<String> {
-    if line == 0 {
-        return None;
-    }
-    let content = fs::read_to_string(path).ok()?;
-    content.lines().nth((line - 1) as usize).map(|s| s.to_string())
 }
 
 fn parse_addr(s: &str) -> Result<u64> {
