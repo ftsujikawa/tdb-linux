@@ -110,6 +110,15 @@ pub struct Debugger {
     /// スレッド(新規に作られたものも含む)は明示的に停止させたままにする
     /// (GDB の `set scheduler-locking on` に相当する簡易実装)。
     locked_tid: Option<Pid>,
+    /// 既知の「プロセスリーダー」(それぞれ独立したアドレス空間を持つ
+    /// プロセス)の tid 集合。最初に起動したプロセス自身に加え、
+    /// `PTRACE_O_TRACEFORK`/`PTRACE_O_TRACEVFORK` により自動アタッチされた
+    /// `fork(2)`/`vfork(2)` 由来の子プロセスもここに入る(`pthread_create`
+    /// 等の `clone(2)` によるスレッドは親と同じアドレス空間を共有するため
+    /// 含めない)。ブレークポイントはメモリ上のバイト列書き換えなので、
+    /// ここに載っている各プロセスへ個別にインストールする必要がある
+    /// (`threads` はスレッド単位、こちらはプロセス単位の集合)。
+    processes: HashSet<Pid>,
 }
 
 /// ハードウェアウォッチポイント1つ分の情報。
@@ -167,6 +176,7 @@ impl Debugger {
             next_thread_id: 1,
             pending_initial_stop: HashSet::new(),
             locked_tid: None,
+            processes: HashSet::new(),
         })
     }
 
@@ -225,6 +235,34 @@ impl Debugger {
         self.thread_ids.iter().find(|(_, &v)| v == tid).map(|(&k, _)| k).unwrap_or(fallback)
     }
 
+    /// `thread apply all <コマンド>` 用に、既知の全スレッド(`fork(2)` 由来の
+    /// 別プロセスのスレッドも含む)の番号を昇順で返す。
+    pub fn thread_ids_sorted(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.thread_ids.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// `thread apply all` の実行中、対象スレッドへ一時的にフォーカスを
+    /// 移す。`switch_thread` と違い `lock` 中の制限を無視する(呼び出し側が
+    /// 必ず `restore_focus` で元に戻す前提の内部専用 API)。
+    pub fn focus_thread_for_apply(&mut self, id: u32) -> Result<()> {
+        let tid = self.resolve_thread_id(id).ok_or_else(|| anyhow!("{}", t!("dbg.thread_not_found", id = id)))?;
+        self.fixup_breakpoint_rip(tid).map_err(|_| anyhow!("{}", t!("dbg.thread_not_stopped", id = id)))?;
+        self.current_tid = Some(tid);
+        Ok(())
+    }
+
+    /// 現在のフォーカスを返す(`thread apply all` 実行前の状態を保存するため)。
+    pub fn current_focus(&self) -> Option<Pid> {
+        self.current_tid
+    }
+
+    /// フォーカスを復元する(`thread apply all` 実行後、元のスレッドへ戻すため)。
+    pub fn restore_focus(&mut self, tid: Option<Pid>) {
+        self.current_tid = tid;
+    }
+
     /// デバッグ対象の終了を記録する。SIGINT 転送スレッドが古い(既に
     /// 終了した)pid に送らないよう、`DEBUGGEE_PID` も併せてクリアする。
     fn mark_exited(&mut self) {
@@ -258,6 +296,7 @@ impl Debugger {
     fn on_thread_gone(&mut self, tid: Pid) {
         self.threads.remove(&tid);
         self.thread_ids.retain(|_, &mut t| t != tid);
+        self.processes.remove(&tid);
         if self.current_tid == Some(tid) {
             self.current_tid = self.threads.iter().next().copied();
         }
@@ -388,7 +427,9 @@ impl Debugger {
     }
 
     /// 実行中のスレッド一覧を表示する (`info threads`)。`lock` 中の
-    /// スレッドには行末に印を付ける。
+    /// スレッドには行末に印を付ける。`fork(2)` 由来の子プロセス(最初に
+    /// 起動したプロセス自身とは異なる、独立したアドレス空間を持つもの)
+    /// には別途プロセスである旨の印を付ける。
     pub fn list_threads(&self) -> Result<()> {
         self.pid()?;
         let mut items: Vec<(&u32, &Pid)> = self.thread_ids.iter().collect();
@@ -403,7 +444,9 @@ impl Debugger {
                 Err(_) => "?".to_string(),
             };
             let lock_tag = if self.locked_tid == Some(tid) { format!(" {}", t!("dbg.thread_list_locked_tag")) } else { String::new() };
-            println!("{} {}: {} ({}){}", current, id, tid.as_raw(), loc, lock_tag);
+            let process_tag =
+                if Some(tid) != self.pid && self.processes.contains(&tid) { format!(" {}", t!("dbg.thread_list_process_tag")) } else { String::new() };
+            println!("{} {}: {} ({}){}{}", current, id, tid.as_raw(), loc, lock_tag, process_tag);
         }
         Ok(())
     }
@@ -446,6 +489,7 @@ impl Debugger {
         self.next_thread_id = 1;
         self.pending_initial_stop.clear();
         self.locked_tid = None;
+        self.processes.clear();
 
         let path = CString::new(self.program.as_os_str().to_str().unwrap())?;
         let mut c_args: Vec<CString> = vec![path.clone()];
@@ -471,11 +515,15 @@ impl Debugger {
                     WaitStatus::Stopped(_, Signal::SIGTRAP) => {}
                     other => bail!("{}", t!("dbg.unexpected_initial_stop", other = other : {:?})),
                 }
-                // 新規スレッド (pthread_create 等の clone(2)) を自動的に
-                // ptrace アタッチさせ、`wait_and_report` の
+                // 新規スレッド (pthread_create 等の clone(2)) に加え、
+                // fork(2)/vfork(2) による子プロセスも自動的に ptrace
+                // アタッチさせ、`wait_and_report` の
                 // `waitpid(None, __WALL)` で検出できるようにする。
-                ptrace::setoptions(child, Options::PTRACE_O_TRACECLONE)
-                    .context("failed to set PTRACE_O_TRACECLONE")?;
+                ptrace::setoptions(
+                    child,
+                    Options::PTRACE_O_TRACECLONE | Options::PTRACE_O_TRACEFORK | Options::PTRACE_O_TRACEVFORK,
+                )
+                .context("failed to set ptrace options")?;
                 // `register_thread` は使わない: メインスレッドの初回停止は
                 // 直前の `waitpid` で既に消化済みのため、
                 // `pending_initial_stop` に入れて二重に読み飛ばしては
@@ -483,6 +531,7 @@ impl Debugger {
                 self.threads.insert(child);
                 self.thread_ids.insert(self.next_thread_id, child);
                 self.next_thread_id += 1;
+                self.processes.insert(child);
             }
         }
 
@@ -652,6 +701,15 @@ impl Debugger {
                 if let Err(e) = bp.enable(tid) {
                     eprintln!("{}", t!("dbg.bp_install_failed", err = e));
                 }
+                // 現在のプロセス以外にも既知のプロセス(fork(2) 由来の子)が
+                // あれば、そちらのメモリにも同じブレークポイントを反映する
+                // (ベストエフォート: 停止していないプロセスへの書き込みは
+                // 失敗しうるが、無視する)。
+                for &leader in &self.processes {
+                    if leader != tid {
+                        let _ = bp.install_in(leader);
+                    }
+                }
             }
         }
         self.breakpoints.insert(addr, bp);
@@ -700,6 +758,11 @@ impl Debugger {
             if let Some(tid) = self.current_tid {
                 if !self.exited {
                     bp.disable(tid)?;
+                    for &leader in &self.processes {
+                        if leader != tid {
+                            let _ = bp.remove_from(leader);
+                        }
+                    }
                 }
             }
         }
@@ -1325,8 +1388,11 @@ impl Debugger {
     /// 含め)バックグラウンドで自由に動いているため、それらのイベントも
     /// ここで捌く必要がある:
     /// - 新規スレッド (`PTRACE_EVENT_CLONE`) は登録してそのまま `continue` する。
-    /// - 既知でない tid の SIGTRAP は、新規スレッドの自動アタッチ直後の
-    ///   初回停止とみなして登録し、`continue` する。
+    /// - 新規プロセス (`PTRACE_EVENT_FORK`/`PTRACE_EVENT_VFORK`) も同様に
+    ///   登録するが、独立したアドレス空間を持つため `processes` にも
+    ///   加える(ブレークポイントの多重インストール対象を決めるため)。
+    /// - 既知でない tid の SIGTRAP は、新規スレッド/プロセスの自動アタッチ
+    ///   直後の初回停止とみなして登録し、`continue` する。
     /// - 追跡中の他のスレッドがブレークポイント/シグナルで停止した場合は、
     ///   `current_tid` をそのスレッドへ切り替えたうえで報告する
     ///   (GDB の all-stop ほど厳密ではないが、「発火したスレッドへ
@@ -1339,6 +1405,12 @@ impl Debugger {
                 if event == libc::PTRACE_EVENT_CLONE {
                     if let Ok(new_tid_raw) = ptrace::getevent(parent_tid) {
                         self.register_thread(Pid::from_raw(new_tid_raw as i32));
+                    }
+                } else if event == libc::PTRACE_EVENT_FORK || event == libc::PTRACE_EVENT_VFORK {
+                    if let Ok(new_pid_raw) = ptrace::getevent(parent_tid) {
+                        let new_pid = Pid::from_raw(new_pid_raw as i32);
+                        self.processes.insert(new_pid);
+                        self.register_thread(new_pid);
                     }
                 }
                 self.resume_or_hold(parent_tid);
@@ -1369,20 +1441,28 @@ impl Debugger {
 
             match status {
                 WaitStatus::Exited(tid, code) => {
+                    let was_process_leader = Some(tid) != self.pid && self.processes.contains(&tid);
                     self.on_thread_gone(tid);
-                    if Some(tid) == self.pid || self.threads.is_empty() {
+                    if self.processes.is_empty() || self.threads.is_empty() {
                         self.mark_exited();
                         println!("{}", t!("dbg.process_exited", code = code));
                         return Ok(());
                     }
+                    if was_process_leader {
+                        println!("{}", t!("dbg.child_process_exited", pid = tid.as_raw(), code = code));
+                    }
                     continue;
                 }
                 WaitStatus::Signaled(tid, sig, _) => {
+                    let was_process_leader = Some(tid) != self.pid && self.processes.contains(&tid);
                     self.on_thread_gone(tid);
-                    if Some(tid) == self.pid || self.threads.is_empty() {
+                    if self.processes.is_empty() || self.threads.is_empty() {
                         self.mark_exited();
                         println!("{}", t!("dbg.process_signaled", sig = sig));
                         return Ok(());
+                    }
+                    if was_process_leader {
+                        println!("{}", t!("dbg.child_process_signaled", pid = tid.as_raw(), sig = sig));
                     }
                     continue;
                 }
@@ -1879,6 +1959,7 @@ impl Debugger {
         self.thread_ids.clear();
         self.pending_initial_stop.clear();
         self.locked_tid = None;
+        self.processes.clear();
         println!("{}", t!("dbg.process_killed"));
         Ok(())
     }

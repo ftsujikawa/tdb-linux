@@ -12,9 +12,13 @@ help:
       watch *<addr式> [長さ]     アドレスへの書き込みでウォッチポイントを設定(長さ省略時8バイト)
       info watchpoints, i w     ウォッチポイント一覧を表示
       delete <n>, d <n>         ブレークポイント/ウォッチポイント n を削除
-      info threads, i t        実行中のスレッド一覧を表示する(現在のスレッドに * が付く、lock 中は [ロック中])
+      info threads, i t        実行中のスレッド一覧を表示する(現在のスレッドに * が付く、lock 中は [ロック中]、
+                                  fork(2) 由来の子プロセスには [プロセス])
       thread <n>                フォーカスするスレッドを切り替える(print/step/backtrace等が対象にする、
                                   <n> は info threads の番号または括弧内の tid のどちらでも可)
+      thread apply all <コマンド>
+                                既知の全スレッド(fork(2) 由来の別プロセスのスレッドも含む)へ順に
+                                  フォーカスを切り替えながらコマンドを実行する(例: thread apply all backtrace)
       lock <n>                  スレッド n だけを実行させ、他のスレッドを停止させる(GDBの scheduler-locking 相当、
                                   <n> は info threads の番号または括弧内の tid のどちらでも可)
       unlock                    lock によるスレッド実行制限を解除し、他のスレッドも再開する
@@ -71,9 +75,14 @@ help:
       watch *<addr-expr> [len]  Set a watchpoint on writes to an address (default length: 8 bytes)
       info watchpoints, i w     List watchpoints
       delete <n>, d <n>         Delete breakpoint/watchpoint n
-      info threads, i t        List running threads (current thread marked with *, [locked] while lock is active)
+      info threads, i t        List running threads (current thread marked with *, [locked] while lock is active,
+                                  [process] for fork(2)-created child processes)
       thread <n>                Switch the focused thread (print/step/backtrace etc. target it;
                                   <n> can be either the info threads number or the tid shown in parentheses)
+      thread apply all <command>
+                                Run a command against every known thread (including threads of
+                                  fork(2)-created child processes), switching focus to each in turn
+                                  (e.g. thread apply all backtrace)
       lock <n>                  Run only thread n, holding all other threads stopped (like GDB's scheduler-locking;
                                   <n> can be either the info threads number or the tid shown in parentheses)
       unlock                    Release the lock set by `lock`, resuming other threads
@@ -192,6 +201,15 @@ repl.usage_info:
 repl.usage_thread:
   ja: "使い方: thread <スレッド番号>"
   en: "Usage: thread <thread-number>"
+repl.usage_thread_apply_all:
+  ja: "使い方: thread apply all <コマンド> (例: thread apply all backtrace)"
+  en: "Usage: thread apply all <command> (e.g. thread apply all backtrace)"
+repl.thread_apply_header:
+  ja: "スレッド %{id}:"
+  en: "Thread %{id}:"
+repl.thread_apply_skip:
+  ja: "スレッド %{id} をスキップしました: %{err}"
+  en: "Skipping thread %{id}: %{err}"
 repl.usage_lock:
   ja: "使い方: lock <スレッド番号>"
   en: "Usage: lock <thread-number>"
@@ -317,6 +335,9 @@ dbg.thread_not_locked:
 dbg.thread_list_locked_tag:
   ja: "[ロック中]"
   en: "[locked]"
+dbg.thread_list_process_tag:
+  ja: "[プロセス]"
+  en: "[process]"
 dbg.thread_locked_cannot_switch:
   ja: "スレッドがロックされているため切り替えできません(先に unlock してください)"
   en: "Cannot switch threads while a thread lock is active (run unlock first)"
@@ -365,6 +386,12 @@ dbg.process_exited:
 dbg.process_signaled:
   ja: "[プロセスはシグナル %{sig} で終了しました]"
   en: "[Process terminated by signal %{sig}]"
+dbg.child_process_exited:
+  ja: "[子プロセス (pid=%{pid}) が終了しました (code=%{code})]"
+  en: "[Child process (pid=%{pid}) exited (code=%{code})]"
+dbg.child_process_signaled:
+  ja: "[子プロセス (pid=%{pid}) がシグナル %{sig} で終了しました]"
+  en: "[Child process (pid=%{pid}) terminated by signal %{sig}]"
 dbg.unexpected_wait:
   ja: "予期しない wait 状態: %{other}"
   en: "Unexpected wait status: %{other}"

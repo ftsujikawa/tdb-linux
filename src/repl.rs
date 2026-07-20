@@ -66,6 +66,18 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
                 Ok(())
             }
         },
+        "thread" if rest.first().copied() == Some("apply") && rest.get(1).copied() == Some("all") => {
+            if rest.len() <= 2 {
+                println!("{}", t!("repl.usage_thread_apply_all"));
+                Ok(())
+            } else {
+                let sub_cmd = rest[2..].join(" ");
+                if !thread_apply_all(dbg, &sub_cmd) {
+                    return false;
+                }
+                Ok(())
+            }
+        }
         "thread" => match rest.first().and_then(|s| s.parse::<u32>().ok()) {
             Some(id) => dbg.switch_thread(id),
             None => {
@@ -198,6 +210,31 @@ fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
     if let Err(e) = result {
         println!("{}", t!("repl.error_prefix", err = format!("{:#}", e)));
     }
+    true
+}
+
+/// `thread apply all <command>` を実装する。既知の全スレッド(`fork(2)`
+/// 由来の別プロセスのスレッドも含む、`info threads` に出てくる全番号)へ
+/// 番号順にフォーカスを切り替えながら `sub_cmd` を実行し、最後に元の
+/// フォーカスへ戻す。対象スレッドが停止していない等でフォーカスできなければ
+/// そのスレッドはスキップして次へ進む。`sub_cmd` が `quit` 等で REPL
+/// ループの終了を要求した場合、フォーカスは復元せずに `false` を返す
+/// (`quit` は既に `dbg.kill()` 側でセッション状態をクリア済みのため)。
+fn thread_apply_all(dbg: &mut Debugger, sub_cmd: &str) -> bool {
+    let ids = dbg.thread_ids_sorted();
+    let saved = dbg.current_focus();
+    for id in ids {
+        match dbg.focus_thread_for_apply(id) {
+            Ok(()) => {
+                println!("{}", t!("repl.thread_apply_header", id = id));
+                if !dispatch(dbg, sub_cmd) {
+                    return false;
+                }
+            }
+            Err(e) => println!("{}", t!("repl.thread_apply_skip", id = id, err = format!("{:#}", e))),
+        }
+    }
+    dbg.restore_focus(saved);
     true
 }
 
