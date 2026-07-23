@@ -13,3 +13,11 @@ gimli = "0.34.0"
 iced-x86 = "1.21.0"
 signal-hook = "0.4.4"
 rust-i18n = "4"
+cfgrammar = "0.15"
+lrlex = "0.15"
+lrpar = "0.15"
+
+[build-dependencies]
+cfgrammar = "0.15"
+lrlex = "0.15"
+lrpar = "0.15"

@@ -1,14 +1,26 @@
 use crate::debugger::Debugger;
 use anyhow::{bail, Result};
+use lrlex::lrlex_mod;
+use lrpar::lrpar_mod;
 use rust_i18n::t;
 
-/// `print`/`set` で使う簡易式評価器。
-/// レジスタ参照 (`$rax` など)、DWARF 情報から解決するローカル変数/仮引数名
-/// (`x` など)、10進/16進(`0x`)整数リテラル、浮動小数点リテラル(`3.4` 等)、
-/// 四則演算・剰余、ビット演算 (`& | ^ ~ << >>`)、単項 `-`、メモリ参照
-/// (`*<addr式>`, 8バイトを読む) 、`()` による優先順位指定に対応する。
-/// `*` は「前に値が続くか」で二項(乗算)/単項(デリファレンス)を判別する。
-/// ビット演算・デリファレンスは整数のみに対応し、浮動小数点数を渡すとエラーになる。
+lrlex_mod!("expr.l");
+lrpar_mod!("expr.y");
+
+// `print`/`set` で使う簡易式評価器。
+// レジスタ参照 (`$rax` など)、DWARF 情報から解決するローカル変数/仮引数名
+// (`x` など)、10進/16進(`0x`)整数リテラル、浮動小数点リテラル(`3.4` 等)、
+// 四則演算・剰余、ビット演算 (`& | ^ ~ << >>`)、単項 `-`、メモリ参照
+// (`*<addr式>`, 8バイトを読む) 、`()` による優先順位指定に対応する。
+// `*` は「前に値が続くか」で二項(乗算)/単項(デリファレンス)を判別する。
+// ビット演算・デリファレンスは整数のみに対応し、浮動小数点数を渡すとエラーになる。
+//
+// 字句解析・構文解析は `lrlex`/`lrpar` (grmtools) で生成したパーサー
+// (`expr.l`/`expr.y`) が行い、構文木 (`RawExpr`) を組み立てる。実際の評価
+// (`Debugger` を使ったレジスタ/メモリ/変数の読み書き) はパーサーの
+// アクションでは行わず、`eval_ast` がその構文木を辿って行う
+// (`Debugger` への参照をパーサーのアクションへ渡す標準的な方法が
+// 不確実なため、パースと評価を分離した設計にしている)。
 
 /// 式の評価結果。整数または浮動小数点数。
 #[derive(Debug, Clone, Copy)]
@@ -53,33 +65,6 @@ fn numeric_binop(l: Value, r: Value, int_op: impl Fn(i64, i64) -> i64, float_op:
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum Token {
-    Num(i64),
-    Float(f64),
-    Reg(String),
-    Ident(String),
-    Plus,
-    Minus,
-    Star,
-    Slash,
-    Percent,
-    Amp,
-    Pipe,
-    Caret,
-    Tilde,
-    Shl,
-    Shr,
-    Arrow,
-    /// `.` (構造体メンバアクセス)。このツールでは `->` と意味を区別せず、
-    /// どちらも同じ `ChainStep::Field` を生成する完全な別名として扱う。
-    Dot,
-    LParen,
-    RParen,
-    LBracket,
-    RBracket,
-}
-
 /// `->field`/`.field`(構造体メンバ)または `[i]`(配列/ポインタの添字)の
 /// 1ステップ。`a->b[2].c` のように混在・連鎖できる。
 #[derive(Debug, Clone)]
@@ -88,398 +73,160 @@ pub enum ChainStep {
     Index(i64),
 }
 
-fn tokenize(input: &str) -> Result<Vec<Token>> {
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0usize;
-    let mut tokens = Vec::new();
+// ---- 構文木 (grmtools が生成するパーサーのアクションが組み立てる) ----
 
-    while i < chars.len() {
-        let c = chars[i];
-        if c.is_whitespace() {
-            i += 1;
-            continue;
-        }
-        match c {
-            '+' => {
-                tokens.push(Token::Plus);
-                i += 1;
-            }
-            '-' if chars.get(i + 1) == Some(&'>') => {
-                tokens.push(Token::Arrow);
-                i += 2;
-            }
-            '-' => {
-                tokens.push(Token::Minus);
-                i += 1;
-            }
-            '*' => {
-                tokens.push(Token::Star);
-                i += 1;
-            }
-            '/' => {
-                tokens.push(Token::Slash);
-                i += 1;
-            }
-            '%' => {
-                tokens.push(Token::Percent);
-                i += 1;
-            }
-            '&' => {
-                tokens.push(Token::Amp);
-                i += 1;
-            }
-            '|' => {
-                tokens.push(Token::Pipe);
-                i += 1;
-            }
-            '^' => {
-                tokens.push(Token::Caret);
-                i += 1;
-            }
-            '~' => {
-                tokens.push(Token::Tilde);
-                i += 1;
-            }
-            '(' => {
-                tokens.push(Token::LParen);
-                i += 1;
-            }
-            ')' => {
-                tokens.push(Token::RParen);
-                i += 1;
-            }
-            '[' => {
-                tokens.push(Token::LBracket);
-                i += 1;
-            }
-            ']' => {
-                tokens.push(Token::RBracket);
-                i += 1;
-            }
-            '.' => {
-                tokens.push(Token::Dot);
-                i += 1;
-            }
-            '<' if chars.get(i + 1) == Some(&'<') => {
-                tokens.push(Token::Shl);
-                i += 2;
-            }
-            '>' if chars.get(i + 1) == Some(&'>') => {
-                tokens.push(Token::Shr);
-                i += 2;
-            }
-            '$' => {
-                let start = i + 1;
-                let mut j = start;
-                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
-                    j += 1;
-                }
-                if j == start {
-                    bail!("{}", t!("expr.reg_name_missing"));
-                }
-                tokens.push(Token::Reg(chars[start..j].iter().collect()));
-                i = j;
-            }
-            _ if c.is_alphabetic() || c == '_' => {
-                let start = i;
-                let mut j = i;
-                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
-                    j += 1;
-                }
-                tokens.push(Token::Ident(chars[start..j].iter().collect()));
-                i = j;
-            }
-            _ if c.is_ascii_digit() => {
-                let start = i;
-                let mut j = i;
-                if c == '0' && matches!(chars.get(j + 1), Some('x') | Some('X')) {
-                    j += 2;
-                    let hex_start = j;
-                    while j < chars.len() && chars[j].is_ascii_hexdigit() {
-                        j += 1;
-                    }
-                    let hex: String = chars[hex_start..j].iter().collect();
-                    let n = i64::from_str_radix(&hex, 16)?;
-                    tokens.push(Token::Num(n));
-                } else {
-                    while j < chars.len() && chars[j].is_ascii_digit() {
-                        j += 1;
-                    }
-                    if chars.get(j) == Some(&'.')
-                        && chars.get(j + 1).map(|c| c.is_ascii_digit()).unwrap_or(false)
-                    {
-                        j += 1;
-                        while j < chars.len() && chars[j].is_ascii_digit() {
-                            j += 1;
-                        }
-                        let s: String = chars[start..j].iter().collect();
-                        tokens.push(Token::Float(s.parse()?));
-                    } else {
-                        let dec: String = chars[start..j].iter().collect();
-                        tokens.push(Token::Num(dec.parse()?));
-                    }
-                }
-                i = j;
-            }
-            _ => bail!("{}", t!("expr.invalid_char", c = c)),
-        }
-    }
-    Ok(tokens)
+#[derive(Debug, Clone, Copy)]
+pub enum UnOp {
+    Neg,
+    Plus,
+    Not,
 }
 
-struct Parser<'a> {
-    tokens: Vec<Token>,
-    pos: usize,
-    dbg: &'a Debugger,
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
 }
 
-impl<'a> Parser<'a> {
-    fn peek(&self) -> Option<&Token> {
-        self.tokens.get(self.pos)
-    }
+/// `[i]` の添字は(`arr[i+1]` のように)完全な式になりうるため、評価前の
+/// 構文木のまま保持する(`ChainStep::Index` は評価後の `i64` を持つ点が
+/// 異なる)。
+#[derive(Debug, Clone)]
+pub enum RawChainStep {
+    Field(String),
+    Index(Box<RawExpr>),
+}
 
-    fn advance(&mut self) -> Option<Token> {
-        let t = self.tokens.get(self.pos).cloned();
-        self.pos += 1;
-        t
-    }
+#[derive(Debug, Clone)]
+pub enum RawExpr {
+    Num(i64),
+    Float(f64),
+    Reg(String),
+    Ident(String),
+    Unary(UnOp, Box<RawExpr>),
+    Binary(BinOp, Box<RawExpr>, Box<RawExpr>),
+    Deref(Box<RawExpr>),
+    AddrOf(String),
+    /// 変数名に `->`/`.`/`[]` の連鎖が1つ以上続く形(連鎖が無い裸の変数名は
+    /// `Ident` になる)。
+    Chain(String, Vec<RawChainStep>),
+}
 
-    fn parse_expr(&mut self) -> Result<Value> {
-        self.parse_or()
+/// `input` を字句解析・構文解析し、構文木を返す。
+fn parse_to_ast(input: &str) -> Result<RawExpr> {
+    let lexerdef = expr_l::lexerdef();
+    let lexer = lexerdef.lexer(input);
+    let (res, errs) = expr_y::parse(&lexer);
+    if !errs.is_empty() {
+        let msgs: Vec<String> = errs.iter().map(|e| e.pp(&lexer, &expr_y::token_epp)).collect();
+        bail!("{}", t!("expr.parse_failed_grmtools", msg = msgs.join(" / ")));
     }
+    res.ok_or_else(|| anyhow::anyhow!("{}", t!("expr.empty")))
+}
 
-    fn parse_or(&mut self) -> Result<Value> {
-        let mut left = self.parse_xor()?;
-        while matches!(self.peek(), Some(Token::Pipe)) {
-            self.advance();
-            let right = self.parse_xor()?;
-            left = Value::Int(require_int(left, "|")? | require_int(right, "|")?);
-        }
-        Ok(left)
-    }
-
-    fn parse_xor(&mut self) -> Result<Value> {
-        let mut left = self.parse_and()?;
-        while matches!(self.peek(), Some(Token::Caret)) {
-            self.advance();
-            let right = self.parse_and()?;
-            left = Value::Int(require_int(left, "^")? ^ require_int(right, "^")?);
-        }
-        Ok(left)
-    }
-
-    fn parse_and(&mut self) -> Result<Value> {
-        let mut left = self.parse_shift()?;
-        while matches!(self.peek(), Some(Token::Amp)) {
-            self.advance();
-            let right = self.parse_shift()?;
-            left = Value::Int(require_int(left, "&")? & require_int(right, "&")?);
-        }
-        Ok(left)
-    }
-
-    fn parse_shift(&mut self) -> Result<Value> {
-        let mut left = self.parse_add()?;
-        loop {
-            match self.peek() {
-                Some(Token::Shl) => {
-                    self.advance();
-                    let right = self.parse_add()?;
-                    let r = require_int(right, "<<")?;
-                    left = Value::Int(require_int(left, "<<")?.wrapping_shl(r as u32));
-                }
-                Some(Token::Shr) => {
-                    self.advance();
-                    let right = self.parse_add()?;
-                    let r = require_int(right, ">>")?;
-                    left = Value::Int(require_int(left, ">>")?.wrapping_shr(r as u32));
-                }
-                _ => break,
-            }
-        }
-        Ok(left)
-    }
-
-    fn parse_add(&mut self) -> Result<Value> {
-        let mut left = self.parse_mul()?;
-        loop {
-            match self.peek() {
-                Some(Token::Plus) => {
-                    self.advance();
-                    let right = self.parse_mul()?;
-                    left = numeric_binop(left, right, |a, b| a.wrapping_add(b), |a, b| a + b);
-                }
-                Some(Token::Minus) => {
-                    self.advance();
-                    let right = self.parse_mul()?;
-                    left = numeric_binop(left, right, |a, b| a.wrapping_sub(b), |a, b| a - b);
-                }
-                _ => break,
-            }
-        }
-        Ok(left)
-    }
-
-    fn parse_mul(&mut self) -> Result<Value> {
-        let mut left = self.parse_unary()?;
-        loop {
-            match self.peek() {
-                Some(Token::Star) => {
-                    self.advance();
-                    let right = self.parse_unary()?;
-                    left = numeric_binop(left, right, |a, b| a.wrapping_mul(b), |a, b| a * b);
-                }
-                Some(Token::Slash) => {
-                    self.advance();
-                    let right = self.parse_unary()?;
-                    if left.is_float() || right.is_float() {
-                        left = Value::Float(left.as_f64() / right.as_f64());
-                    } else {
-                        let r = right.as_i64();
-                        if r == 0 {
-                            bail!("{}", t!("expr.div_by_zero"));
-                        }
-                        left = Value::Int(left.as_i64().wrapping_div(r));
-                    }
-                }
-                Some(Token::Percent) => {
-                    self.advance();
-                    let right = self.parse_unary()?;
-                    if left.is_float() || right.is_float() {
-                        left = Value::Float(left.as_f64() % right.as_f64());
-                    } else {
-                        let r = right.as_i64();
-                        if r == 0 {
-                            bail!("{}", t!("expr.rem_by_zero"));
-                        }
-                        left = Value::Int(left.as_i64().wrapping_rem(r));
-                    }
-                }
-                _ => break,
-            }
-        }
-        Ok(left)
-    }
-
-    /// 単項演算子。`*` はここでのみ「デリファレンス」として扱われ、
-    /// `parse_mul` のループ側では「乗算」として扱われる。`&` も同様に、
-    /// ここでのみ「アドレス取得」として扱われ、`parse_and` のループ側では
-    /// 「ビットAND」として扱われる。
-    fn parse_unary(&mut self) -> Result<Value> {
-        match self.peek() {
-            Some(Token::Minus) => {
-                self.advance();
-                Ok(match self.parse_unary()? {
+/// 構文木を辿って実際に評価する(レジスタ/メモリ/変数へのアクセスは
+/// ここで初めて発生する)。
+fn eval_ast(ast: &RawExpr, dbg: &Debugger) -> Result<Value> {
+    match ast {
+        RawExpr::Num(n) => Ok(Value::Int(*n)),
+        RawExpr::Float(f) => Ok(Value::Float(*f)),
+        RawExpr::Reg(name) => Ok(Value::Int(dbg.get_reg(name)? as i64)),
+        RawExpr::Ident(name) => dbg.read_variable(name),
+        RawExpr::Unary(op, inner) => {
+            let v = eval_ast(inner, dbg)?;
+            match op {
+                UnOp::Neg => Ok(match v {
                     Value::Int(i) => Value::Int(i.wrapping_neg()),
                     Value::Float(f) => Value::Float(-f),
-                })
+                }),
+                UnOp::Plus => Ok(v),
+                UnOp::Not => Ok(Value::Int(!require_int(v, "~")?)),
             }
-            Some(Token::Plus) => {
-                self.advance();
-                self.parse_unary()
-            }
-            Some(Token::Tilde) => {
-                self.advance();
-                let v = self.parse_unary()?;
-                Ok(Value::Int(!require_int(v, "~")?))
-            }
-            Some(Token::Star) => {
-                self.advance();
-                let addr_val = self.parse_unary()?;
-                let addr = require_int(addr_val, &t!("expr.deref_op"))? as u64;
-                let bytes = self.dbg.read_mem(addr, 8)?;
-                Ok(Value::Int(i64::from_ne_bytes(bytes.try_into().unwrap())))
-            }
-            Some(Token::Amp) => {
-                self.advance();
-                match self.advance() {
-                    Some(Token::Ident(name)) => Ok(Value::Int(self.dbg.variable_address(&name)? as i64)),
-                    _ => bail!("{}", t!("expr.amp_var_only")),
-                }
-            }
-            _ => self.parse_postfix(),
+        }
+        RawExpr::Deref(inner) => {
+            let addr_val = eval_ast(inner, dbg)?;
+            let addr = require_int(addr_val, &t!("expr.deref_op"))? as u64;
+            let bytes = dbg.read_mem(addr, 8)?;
+            Ok(Value::Int(i64::from_ne_bytes(bytes.try_into().unwrap())))
+        }
+        RawExpr::AddrOf(name) => Ok(Value::Int(dbg.variable_address(name)? as i64)),
+        RawExpr::Binary(op, l, r) => {
+            let left = eval_ast(l, dbg)?;
+            let right = eval_ast(r, dbg)?;
+            eval_binop(*op, left, right)
+        }
+        RawExpr::Chain(base, steps) => {
+            let resolved = resolve_chain_steps(steps, dbg)?;
+            dbg.read_member_chain(base, &resolved)
         }
     }
+}
 
-    /// 後置の `->field` / `.field` / `[式]` によるメンバ/添字アクセス連鎖
-    /// (`a->b[2].c` のように混在・連鎖できる)。`Ident` の直後にそのいずれか
-    /// が続く場合のみ特別扱いする。`base_name` の DWARF 型情報が必要なため、
-    /// 連鎖の先頭は裸の変数名でなければならない。
-    fn parse_postfix(&mut self) -> Result<Value> {
-        if let Some(Token::Ident(name)) = self.peek().cloned() {
-            if matches!(
-                self.tokens.get(self.pos + 1),
-                Some(Token::Arrow) | Some(Token::Dot) | Some(Token::LBracket)
-            ) {
-                self.advance(); // Ident
-                let mut steps = Vec::new();
-                while let Some(step) = self.try_consume_chain_step()? {
-                    steps.push(step);
+fn eval_binop(op: BinOp, l: Value, r: Value) -> Result<Value> {
+    match op {
+        BinOp::Add => Ok(numeric_binop(l, r, |a, b| a.wrapping_add(b), |a, b| a + b)),
+        BinOp::Sub => Ok(numeric_binop(l, r, |a, b| a.wrapping_sub(b), |a, b| a - b)),
+        BinOp::Mul => Ok(numeric_binop(l, r, |a, b| a.wrapping_mul(b), |a, b| a * b)),
+        BinOp::Div => {
+            if l.is_float() || r.is_float() {
+                Ok(Value::Float(l.as_f64() / r.as_f64()))
+            } else {
+                let rv = r.as_i64();
+                if rv == 0 {
+                    bail!("{}", t!("expr.div_by_zero"));
                 }
-                return self.dbg.read_member_chain(&name, &steps);
+                Ok(Value::Int(l.as_i64().wrapping_div(rv)))
             }
         }
-        self.parse_primary()
+        BinOp::Rem => {
+            if l.is_float() || r.is_float() {
+                Ok(Value::Float(l.as_f64() % r.as_f64()))
+            } else {
+                let rv = r.as_i64();
+                if rv == 0 {
+                    bail!("{}", t!("expr.rem_by_zero"));
+                }
+                Ok(Value::Int(l.as_i64().wrapping_rem(rv)))
+            }
+        }
+        BinOp::And => Ok(Value::Int(require_int(l, "&")? & require_int(r, "&")?)),
+        BinOp::Or => Ok(Value::Int(require_int(l, "|")? | require_int(r, "|")?)),
+        BinOp::Xor => Ok(Value::Int(require_int(l, "^")? ^ require_int(r, "^")?)),
+        BinOp::Shl => {
+            let rv = require_int(r, "<<")?;
+            Ok(Value::Int(require_int(l, "<<")?.wrapping_shl(rv as u32)))
+        }
+        BinOp::Shr => {
+            let rv = require_int(r, ">>")?;
+            Ok(Value::Int(require_int(l, ">>")?.wrapping_shr(rv as u32)))
+        }
     }
+}
 
-    /// 現在位置が `->field` / `.field` / `[式]` ならそれを1ステップとして
-    /// 消費して返す。どれでもなければ何も消費せず `None` を返す。`->` と
-    /// `.` は完全な別名として同じ扱い。添字の中身は完全な式として
-    /// 再帰的に評価する(`arr[i+1]` 等も可)。
-    fn try_consume_chain_step(&mut self) -> Result<Option<ChainStep>> {
-        match self.peek() {
-            Some(Token::Arrow) | Some(Token::Dot) => {
-                let op = if matches!(self.peek(), Some(Token::Arrow)) { "->" } else { "." };
-                self.advance();
-                match self.advance() {
-                    Some(Token::Ident(field)) => Ok(Some(ChainStep::Field(field))),
-                    other => {
-                        bail!("{}", t!("expr.member_name_required", op = op, other = other : {:?}))
-                    }
-                }
-            }
-            Some(Token::LBracket) => {
-                self.advance();
-                let idx_val = self.parse_expr()?;
-                match self.advance() {
-                    Some(Token::RBracket) => Ok(Some(ChainStep::Index(idx_val.as_i64()))),
-                    other => bail!("{}", t!("expr.rbracket_missing", other = other : {:?})),
-                }
-            }
-            _ => Ok(None),
-        }
-    }
-
-    fn parse_primary(&mut self) -> Result<Value> {
-        match self.advance() {
-            Some(Token::Num(n)) => Ok(Value::Int(n)),
-            Some(Token::Float(f)) => Ok(Value::Float(f)),
-            Some(Token::Reg(name)) => Ok(Value::Int(self.dbg.get_reg(&name)? as i64)),
-            Some(Token::Ident(name)) => self.dbg.read_variable(&name),
-            Some(Token::LParen) => {
-                let v = self.parse_expr()?;
-                match self.advance() {
-                    Some(Token::RParen) => Ok(v),
-                    _ => bail!("{}", t!("expr.rparen_missing")),
-                }
-            }
-            other => bail!("{}", t!("expr.parse_failed", other = other : {:?})),
-        }
-    }
+/// `RawChainStep` 列を、添字式を評価しつつ `ChainStep` 列(`Debugger` の
+/// `read_member_chain`/`write_member_chain` が受け取る形)へ変換する。
+fn resolve_chain_steps(steps: &[RawChainStep], dbg: &Debugger) -> Result<Vec<ChainStep>> {
+    steps
+        .iter()
+        .map(|s| match s {
+            RawChainStep::Field(name) => Ok(ChainStep::Field(name.clone())),
+            RawChainStep::Index(expr) => Ok(ChainStep::Index(eval_ast(expr, dbg)?.as_i64())),
+        })
+        .collect()
 }
 
 /// `input` を式として評価する。
 pub fn eval(input: &str, dbg: &Debugger) -> Result<Value> {
-    let tokens = tokenize(input)?;
-    if tokens.is_empty() {
-        bail!("{}", t!("expr.empty"));
-    }
-    let mut parser = Parser { tokens, pos: 0, dbg };
-    let value = parser.parse_expr()?;
-    if parser.pos != parser.tokens.len() {
-        bail!("{}", t!("expr.trailing_input"));
-    }
-    Ok(value)
+    let ast = parse_to_ast(input)?;
+    eval_ast(&ast, dbg)
 }
 
 /// 式の DWARF 型が分かっている場合の付加情報。`print` の表示形式(ポインタ
@@ -514,38 +261,32 @@ pub fn eval_typed(input: &str, dbg: &Debugger) -> Result<PrintResult> {
             return dbg.read_address_for_print(inner);
         }
     }
-    if let Some((base, steps)) = parse_pure_chain(trimmed, dbg)? {
-        return dbg.read_chain_for_print(&base, &steps);
+    if let Some(inner) = trimmed.strip_prefix('*') {
+        let inner = inner.trim();
+        if is_bare_ident(inner) {
+            return dbg.read_deref_for_print(inner);
+        }
     }
-    Ok(PrintResult::Value(eval(input, dbg)?, None))
+    let ast = parse_to_ast(input)?;
+    if let RawExpr::Chain(base, steps) = &ast {
+        let resolved = resolve_chain_steps(steps, dbg)?;
+        return dbg.read_chain_for_print(base, &resolved);
+    }
+    Ok(PrintResult::Value(eval_ast(&ast, dbg)?, None))
 }
 
 /// 入力全体が「変数名に `->field`/`.field`/`[式]` の連鎖だけが続く」形に
 /// なっているかを判定し、そうであれば `(変数名, ステップ列)` を返す。
 /// それ以外の演算子が混じっている場合や、そもそも変数名から始まっていない
-/// 場合は `None`。`print`/`set` が構造体/配列を整形表示するかどうかの判定
-/// に使う(単純な `eval` では連鎖の最終結果がスカラーに変換されてしまう
-/// ため)。
+/// 場合、あるいは連鎖が1つも無い裸の変数名の場合は `None`。`print`/`set` が
+/// 構造体/配列を整形表示するかどうかの判定に使う(単純な `eval` では連鎖の
+/// 最終結果がスカラーに変換されてしまうため)。
 pub fn parse_pure_chain(input: &str, dbg: &Debugger) -> Result<Option<(String, Vec<ChainStep>)>> {
-    let tokens = tokenize(input)?;
-    if !matches!(tokens.first(), Some(Token::Ident(_))) {
-        return Ok(None);
+    let ast = parse_to_ast(input)?;
+    match ast {
+        RawExpr::Chain(base, steps) => Ok(Some((base, resolve_chain_steps(&steps, dbg)?))),
+        _ => Ok(None),
     }
-    if !matches!(tokens.get(1), Some(Token::Arrow) | Some(Token::Dot) | Some(Token::LBracket)) {
-        return Ok(None);
-    }
-    let mut parser = Parser { tokens, pos: 0, dbg };
-    let Some(Token::Ident(base)) = parser.advance() else {
-        unreachable!("直前に Ident であることを確認済み");
-    };
-    let mut steps = Vec::new();
-    while let Some(step) = parser.try_consume_chain_step()? {
-        steps.push(step);
-    }
-    if parser.pos != parser.tokens.len() {
-        return Ok(None); // 末尾に演算子等が残っている場合は「純粋な連鎖」ではない
-    }
-    Ok(Some((base, steps)))
 }
 
 fn is_bare_ident(s: &str) -> bool {

@@ -40,7 +40,9 @@ help:
                                   fs_base/gs_base・x87 st0-st7・SSE xmm0-xmm15・mxcsr)
       print <式>, p <式>        式を評価して表示する (例: p $rax, p x+1, p *$rsp,
                                   p &x, p ptr->field, p ptr.field, p arr, p arr[0],
-                                  p arr[0]->x)
+                                  p arr[0]->x)。p *ptr (ptr がポインタ変数そのもの)は
+                                  指し示す先の値を型情報付きで表示する
+                                  (構造体/配列ならその中身を表示)
       print/fmt <式>            フォーマット指定して表示する (fmt: x=16進 o=8進
                                   t=2進 d/i=10進 c=文字 s=文字列, 例: p/x $rax)
       set $<reg>=<式>           レジスタに式の評価値を設定する(st0-st7は浮動小数点数として、
@@ -105,7 +107,9 @@ help:
                                   segment, fs_base/gs_base, x87 st0-st7, SSE xmm0-xmm15, mxcsr)
       print <expr>, p <expr>    Evaluate and print an expression (e.g. p $rax, p x+1, p *$rsp,
                                   p &x, p ptr->field, p ptr.field, p arr, p arr[0],
-                                  p arr[0]->x)
+                                  p arr[0]->x). p *ptr (ptr being a bare pointer variable)
+                                  shows the typed pointee value (struct/array contents if
+                                  applicable)
       print/fmt <expr>          Print with a format (fmt: x=hex o=octal t=binary d/i=decimal
                                   c=char s=string, e.g. p/x $rax)
       set $<reg>=<expr>         Set a register (st0-st7 as floating point, xmm0-xmm15 as the
@@ -145,39 +149,18 @@ expr.float_op_unsupported:
 expr.deref_op:
   ja: "* (デリファレンス)"
   en: "* (dereference)"
-expr.reg_name_missing:
-  ja: "'$' の後にレジスタ名がありません"
-  en: "A register name is required after '$'"
-expr.invalid_char:
-  ja: "式に不正な文字があります: '%{c}'"
-  en: "Invalid character in expression: '%{c}'"
 expr.div_by_zero:
   ja: "0 による除算です"
   en: "Division by zero"
 expr.rem_by_zero:
   ja: "0 による剰余演算です"
   en: "Modulo by zero"
-expr.amp_var_only:
-  ja: "'&' は変数名にのみ使えます (例: &x)"
-  en: "'&' can only be used with a variable name (e.g. &x)"
-expr.member_name_required:
-  ja: "'%{op}' の後にはメンバ名が必要です (与えられたもの: %{other})"
-  en: "A member name is required after '%{op}' (got: %{other})"
-expr.rbracket_missing:
-  ja: "'[' に対応する ']' がありません (与えられたもの: %{other})"
-  en: "Missing ']' matching '[' (got: %{other})"
-expr.rparen_missing:
-  ja: "閉じ括弧 ')' がありません"
-  en: "Missing closing ')'"
-expr.parse_failed:
-  ja: "式を解析できません (予期しないトークン: %{other})"
-  en: "Failed to parse expression (unexpected token: %{other})"
 expr.empty:
   ja: "式が空です"
   en: "Expression is empty"
-expr.trailing_input:
-  ja: "式の末尾に余分な入力があります"
-  en: "Unexpected input after the end of the expression"
+expr.parse_failed_grmtools:
+  ja: "式を解析できません: %{msg}"
+  en: "Failed to parse expression: %{msg}"
 
 # ---- repl.rs ----
 repl.banner:
@@ -476,6 +459,9 @@ dbg.not_array_or_pointer:
 dbg.write_unsupported_type:
   ja: "この型への書き込みには対応していません"
   en: "Writing to this type is not supported"
+dbg.deref_not_pointer:
+  ja: "'%{name}' はポインタ型ではないため、'*%{name}' を評価できません"
+  en: "'%{name}' is not a pointer type, cannot evaluate '*%{name}'"
 dbg.no_frame_base:
   ja: "frame_base 情報がありません"
   en: "No frame_base information available"

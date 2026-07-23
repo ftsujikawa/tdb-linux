@@ -1499,6 +1499,16 @@ impl Debugger {
                 WaitStatus::Stopped(tid, sig) => {
                     self.current_tid = Some(tid);
                     println!("{}", t!("dbg.stopped_signal", sig = sig));
+                    // SIGINT (Ctrl-C) による停止は、GDB 同様ユーザーが実行中の
+                    // デバッグ対象を一時停止させて状況を見たいという意図が
+                    // 明確なため、停止した PC のソース位置(無ければ逆アセンブル)
+                    // も併せて表示する。他のシグナル(クラッシュ系等)では
+                    // 従来通りシグナル名のみを表示する。
+                    if sig == Signal::SIGINT {
+                        if let Ok(regs) = registers::get_regs(tid) {
+                            self.show_stop_location(regs.rip);
+                        }
+                    }
                     return Ok(());
                 }
                 other => {
@@ -2057,6 +2067,30 @@ impl Debugger {
         let ptr_ty = dwarf_info::TypeInfo::Pointer { pointee: Box::new(var.ty) };
         let hint = expr::TypeHint { is_pointer: true, type_name: ptr_ty.type_name() };
         Ok(expr::PrintResult::Value(expr::Value::Int(addr as i64), Some(hint)))
+    }
+
+    /// `print *name` 専用。`name` がポインタ型のローカル変数/仮引数の場合に
+    /// 限り、`*<addr式>` の生の8バイト読み(型情報なし)ではなく、DWARF の
+    /// 指し示す先の型(pointee)を使って指し示す先の値を読む。指し示す先が
+    /// 構造体/配列なら整形済み文字列(`set print pretty`/`set print elements`
+    /// を反映)を、スカラー/ポインタなら型名付きの値を返す。`name` が
+    /// ポインタ型でない場合はエラーにする(`*<変数以外の式>` は従来通り
+    /// `expr::eval_ast` の `RawExpr::Deref` 経由の生の8バイト読みのまま)。
+    pub fn read_deref_for_print(&self, name: &str) -> Result<expr::PrintResult> {
+        let (addr, var) = self.resolve_variable(name)?;
+        let pointee = match &var.ty {
+            dwarf_info::TypeInfo::Pointer { pointee } => pointee.as_ref(),
+            _ => bail!("{}", t!("dbg.deref_not_pointer", name = name)),
+        };
+        let ptr_value = self.read_typed_value(addr, &var.ty)?;
+        let target_addr = ptr_value.as_i64() as u64;
+        if matches!(pointee, dwarf_info::TypeInfo::Struct { .. } | dwarf_info::TypeInfo::Array { .. }) {
+            return Ok(expr::PrintResult::Text(self.format_value_by_type(target_addr, pointee, 0)));
+        }
+        let value = self.read_typed_value(target_addr, pointee)?;
+        let hint =
+            expr::TypeHint { is_pointer: matches!(pointee, dwarf_info::TypeInfo::Pointer { .. }), type_name: pointee.type_name() };
+        Ok(expr::PrintResult::Value(value, Some(hint)))
     }
 
     /// 現在の関数のローカル変数一覧を表示する (`show locals`)。

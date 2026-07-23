@@ -1,8 +1,22 @@
 use crate::debugger::Debugger;
 use crate::expr;
+use lrlex::lrlex_mod;
+use lrpar::{Lexeme, Lexer, NonStreamingLexer};
 use rust_i18n::t;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+
+lrlex_mod!("command.l");
+
+/// コマンド行を空白区切りの単語列に分割する。`split_whitespace()` と
+/// 等価な結果を返すが、実装は `lrlex` (grmtools) で生成したレキサー
+/// (`command.l`)。各コマンドの引数解釈自体は従来通り `dispatch` 以下の
+/// Rust コードが行う(字句分割の実装だけを置き換える)。
+fn tokenize_command(line: &str) -> Vec<&str> {
+    let lexerdef = command_l::lexerdef();
+    let lexer = lexerdef.lexer(line);
+    lexer.iter().filter_map(Result::ok).map(|lexeme| lexer.span_str(lexeme.span())).collect()
+}
 
 pub fn run_repl(mut dbg: Debugger) {
     let mut rl = DefaultEditor::new().expect("failed to init line editor");
@@ -37,7 +51,8 @@ pub fn run_repl(mut dbg: Debugger) {
 
 /// false を返したらループを終了する。
 fn dispatch(dbg: &mut Debugger, line: &str) -> bool {
-    let mut parts = line.split_whitespace();
+    let tokens = tokenize_command(line);
+    let mut parts = tokens.iter().copied();
     let cmd = parts.next().unwrap_or("");
     let rest: Vec<&str> = parts.collect();
 
