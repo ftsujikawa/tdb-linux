@@ -437,10 +437,18 @@ impl Debugger {
         for (id, &tid) in items {
             let current = if Some(tid) == self.current_tid { "*" } else { " " };
             let loc = match self.peek_breakpoint_rip(tid) {
-                Ok(regs) => match self.dwarf.lookup(regs.rip.wrapping_sub(self.load_bias)) {
-                    Some(row) => format!("{:#018x} in {} at {}:{}", regs.rip, self.symbol_at(regs.rip), row.file.display(), row.line),
-                    None => format!("{:#018x} in {}", regs.rip, self.symbol_at(regs.rip)),
-                },
+                Ok(regs) => {
+                    let link_addr = regs.rip.wrapping_sub(self.load_bias);
+                    let sym = match self.elf.find_by_addr(link_addr) {
+                        Some(s) if link_addr == s.addr => s.name.clone(),
+                        Some(s) => format!("{}+{:#x}", s.name, link_addr - s.addr),
+                        None => "??".to_string(),
+                    };
+                    match self.dwarf.lookup(link_addr) {
+                        Some(row) => format!("{:#018x} in {} at {}:{}", regs.rip, sym, row.file.display(), row.line),
+                        None => format!("{:#018x} in {}", regs.rip, sym),
+                    }
+                }
                 Err(_) => "?".to_string(),
             };
             let lock_tag = if self.locked_tid == Some(tid) { format!(" {}", t!("dbg.thread_list_locked_tag")) } else { String::new() };
@@ -724,11 +732,11 @@ impl Debugger {
         }
         for (id, addr) in self.bp_ids.iter() {
             let link_addr = addr.wrapping_sub(self.load_bias);
-            let sym = self
-                .elf
-                .find_by_addr(link_addr)
-                .map(|s| s.name.clone())
-                .unwrap_or_else(|| "?".to_string());
+            let sym = match self.elf.find_by_addr(link_addr) {
+                Some(s) if link_addr == s.addr => s.name.clone(),
+                Some(s) => format!("{}+{:#x}", s.name, link_addr - s.addr),
+                None => "?".to_string(),
+            };
             let enabled = self
                 .breakpoints
                 .get(addr)
@@ -2617,7 +2625,11 @@ impl Debugger {
         let mut rbp = regs.rbp;
         for depth in 0..64 {
             let link_ip = rip.wrapping_sub(self.load_bias);
-            let sym = self.symbol_at(rip);
+            let sym = match self.elf.find_by_addr(link_ip) {
+                Some(s) if link_ip == s.addr => s.name.clone(),
+                Some(s) => format!("{}+{:#x}", s.name, link_ip - s.addr),
+                None => "??".to_string(),
+            };
             match self.dwarf.lookup(link_ip) {
                 Some(row) => println!(
                     "#{:<2} {:#018x} in {} at {}:{}",
