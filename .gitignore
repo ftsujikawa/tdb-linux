@@ -1,3 +1,9 @@
 /target
 /examples/hello
 /examples/hello_pie
+/examples/hello_nodbg
+/examples/target
+/examples/thread_target
+/examples/fork_target
+/examples/leak_target
+/examples/.*.tmp.*
