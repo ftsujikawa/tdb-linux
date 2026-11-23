@@ -418,3 +418,42 @@ mod break_target_cases {
         );
     }
 }
+
+#[test]
+fn breakpoint_added_after_fork_patches_and_restores_both_processes() {
+    let mut session = Session::spawn(&target_fork(), &[]);
+    // Lock the parent before fork so the child stays in its initial ptrace stop.
+    session.send(&["break work", "run", "lock 1", "continue", "syms finish_msg"]);
+    let output = session.sync();
+    let address = output
+        .lines()
+        .find(|line| line.ends_with(" finish_msg") && line.starts_with("0x"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_else(|| panic!("missing finish_msg address\n{output}"));
+    let dump = format!("thread apply all x/8 {address}");
+    let install = format!("break *{address}");
+
+    session.send(&[&dump, &install, &dump, "delete 2", &dump, "quit"]);
+    let output = session.finish();
+    let dump_prefix = format!("{address}:");
+    let dumps: Vec<Vec<_>> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix(&dump_prefix))
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(dumps.len(), 6, "{output}");
+    let original = &dumps[0];
+    assert_eq!(original.len(), 8, "{output}");
+    assert_ne!(original[0], "cc", "{output}");
+    let mut patched = original.clone();
+    patched[0] = "cc";
+
+    for (dump, expected) in dumps
+        .iter()
+        .zip([original, original, &patched, &patched, original, original])
+    {
+        assert_eq!(dump, expected, "{output}");
+    }
+    assert_contains(&output, "ブレークポイント 2 を削除しました");
+    assert_not_contains(&output, "エラー:");
+}
