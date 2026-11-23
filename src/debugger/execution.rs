@@ -83,7 +83,7 @@ impl Debugger {
         }
         let pid = self.pid()?;
         ptrace::cont(pid, None)?;
-        let result = self.wait_and_report();
+        let result = self.wait_and_report(None);
         if self.leak.enabled {
             self.uninstall_leak_breakpoints();
         }
@@ -91,23 +91,15 @@ impl Debugger {
     }
 
     pub fn stepi(&mut self) -> Result<()> {
-        self.pid()?;
-        if let Some(msg) = self.step_over_current_breakpoint()? {
-            return self.report_watchpoint(msg);
-        }
-        if self.exited {
-            return Ok(());
-        }
-        let pid = self.pid()?;
-        ptrace::step(pid, None)?;
-        self.wait_and_report()
+        let status = self.single_step_raw()?;
+        self.wait_and_report(Some(status))
     }
 
     /// call 命令をまたいでステップ実行する (機械語命令単位)。
     pub fn nexti(&mut self) -> Result<()> {
         let pid = self.pid()?;
         let regs = registers::get_regs(pid)?;
-        let code = self.read_mem(regs.rip, 16).unwrap_or_default();
+        let code = self.read_mem_for_display(regs.rip, 16).unwrap_or_default();
         if let Some(len) = call_instruction_len(&code) {
             let ret_addr = regs.rip + len as u64;
             let had_bp = self.breakpoints.contains_key(&ret_addr);
@@ -117,14 +109,14 @@ impl Debugger {
                 self.breakpoints.insert(ret_addr, tmp);
             }
             let prev_target = self.skip_target.replace(ret_addr);
-            self.cont()?;
+            let result = self.cont();
             self.skip_target = prev_target;
             if !had_bp && !self.exited {
                 if let Some(mut bp) = self.breakpoints.remove(&ret_addr) {
                     bp.disable(pid)?;
                 }
             }
-            Ok(())
+            result
         } else {
             self.stepi()
         }
@@ -187,7 +179,7 @@ impl Debugger {
                 let pid = self.pid()?;
                 let mut regs = registers::get_regs(pid)?;
                 let bp_addr = regs.rip.wrapping_sub(1);
-                if self.breakpoints.contains_key(&bp_addr) {
+                if self.breakpoints.contains_key(&bp_addr) && !is_single_step_trap(pid) {
                     regs.rip = bp_addr;
                     registers::set_regs(pid, &regs)?;
                     // `nexti`/`up`/`next` などが内部で使う一時ブレークポイントは
@@ -336,6 +328,10 @@ impl Debugger {
                             return Ok(());
                         }
                         Some(_) => continue,
+                        None if temp_bp == Some(rip) => {
+                            self.show_stop_location(rip);
+                            return Ok(());
+                        }
                         None => {
                             self.finish_undebugged_frame()?;
                             if self.exited {
@@ -472,9 +468,12 @@ impl Debugger {
     ///   `current_tid` をそのスレッドへ切り替えたうえで報告する
     ///   (GDB の all-stop ほど厳密ではないが、「発火したスレッドへ
     ///   フォーカスが移る」という体験は再現する)。
-    fn wait_and_report(&mut self) -> Result<()> {
+    fn wait_and_report(&mut self, mut initial_status: Option<WaitStatus>) -> Result<()> {
         loop {
-            let status = waitpid(None, Some(WaitPidFlag::__WALL))?;
+            let status = match initial_status.take() {
+                Some(status) => status,
+                None => waitpid(None, Some(WaitPidFlag::__WALL))?,
+            };
 
             if let WaitStatus::PtraceEvent(parent_tid, Signal::SIGTRAP, event) = status {
                 if event == libc::PTRACE_EVENT_CLONE {
@@ -555,7 +554,7 @@ impl Debugger {
                     }
                     let mut regs = registers::get_regs(pid)?;
                     let bp_addr = regs.rip.wrapping_sub(1);
-                    if self.breakpoints.contains_key(&bp_addr) {
+                    if self.breakpoints.contains_key(&bp_addr) && !is_single_step_trap(pid) {
                         regs.rip = bp_addr;
                         registers::set_regs(pid, &regs)?;
                         if self.leak.enabled && self.handle_leak_breakpoint(bp_addr)? {
@@ -605,6 +604,10 @@ impl Debugger {
             }
         }
     }
+}
+
+fn is_single_step_trap(pid: Pid) -> bool {
+    ptrace::getsiginfo(pid).is_ok_and(|info| info.si_code == libc::TRAP_TRACE)
 }
 
 /// 先頭が call 命令であればその命令長を返す。
@@ -657,5 +660,34 @@ fn call_instruction_len(bytes: &[u8]) -> Option<usize> {
             Some(len)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::call_instruction_len;
+
+    #[test]
+    fn call_length_accounts_for_prefixes_modrm_sib_and_displacement() {
+        let calls: &[(&[u8], usize)] = &[
+            (&[0xe8, 0, 0, 0, 0], 5),
+            (&[0x66, 0x48, 0xff, 0xd0], 4),
+            (&[0xff, 0x18], 2),
+            (&[0xff, 0x15, 0, 0, 0, 0], 6),
+            (&[0xff, 0x14, 0x25, 0, 0, 0, 0], 7),
+            (&[0xff, 0x54, 0x24, 0x08], 4),
+            (&[0xff, 0x90, 0, 0, 0, 0], 6),
+        ];
+        for (bytes, expected) in calls {
+            assert_eq!(call_instruction_len(bytes), Some(*expected), "{bytes:x?}");
+        }
+    }
+
+    #[test]
+    fn non_calls_and_missing_opcodes_or_modrm_bytes_are_rejected() {
+        let non_calls: &[&[u8]] = &[&[], &[0x48], &[0xff], &[0xff, 0xe0], &[0x90]];
+        for bytes in non_calls {
+            assert_eq!(call_instruction_len(bytes), None, "{bytes:x?}");
+        }
     }
 }

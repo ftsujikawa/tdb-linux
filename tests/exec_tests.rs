@@ -141,3 +141,407 @@ fn continue_before_run_reports_error_without_crashing() {
     // 後続の `help` が実行できている = REPL が継続していることの確認。
     assert_contains(&out, "run, r");
 }
+
+#[test]
+fn source_step_resumes_at_the_next_line_after_a_library_call() {
+    let target = build_example("break_target", "break_target.c", &["-no-pie"]);
+    let out = run_script(
+        &target,
+        &[],
+        &["break break_target.c:15", "run", "continue", "step", "quit"],
+    );
+    assert_contains(&out, ">  15");
+    assert_contains(&out, ">  13");
+    assert_count(&out, "ブレークポイントで停止:", 1);
+    assert_not_contains(&out, "エラー:");
+}
+
+#[test]
+fn source_step_and_next_report_a_watchpoint_before_advancing_the_line() {
+    let target = build_example("break_target", "break_target.c", &["-no-pie"]);
+    for command in ["step", "next"] {
+        let out = run_script(
+            &target,
+            &[],
+            &["break add", "run", "continue", "watch sum", command, "quit"],
+        );
+        assert_contains(&out, "ウォッチポイント 2 がトリガーされました: sum");
+        assert_contains(&out, "新値 = 0x1");
+        assert_not_contains(&out, "エラー:");
+    }
+}
+
+#[test]
+fn continue_reports_inferior_termination_by_signal() {
+    let out = run_script(
+        &coverage_target(),
+        &["kill"],
+        &["lang en", "run", "continue", "quit"],
+    );
+    assert_contains(&out, "Process terminated by signal SIGKILL");
+    assert_not_contains(&out, "Error:");
+}
+
+fn execution_target() -> std::path::PathBuf {
+    build_example("execution_target", "execution_target.c", &["-no-pie"])
+}
+
+fn instruction_address(target: &std::path::Path, symbol: &str) -> u64 {
+    let output = std::process::Command::new("nm").arg(target).output().unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let symbols = String::from_utf8(output.stdout).unwrap();
+    let address = symbols
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let address = fields.next()?;
+            (fields.nth(1) == Some(symbol)).then_some(address)
+        })
+        .unwrap_or_else(|| panic!("missing instruction label {symbol}"));
+    u64::from_str_radix(address, 16).unwrap()
+}
+
+#[test]
+fn watchpoint_fires_while_stepping_over_the_current_breakpoint_instruction() {
+    let target = execution_target();
+    let address = instruction_address(&target, "store_value");
+    let breakpoint = format!("break *{address:#x}");
+    for command in ["continue", "stepi", "nexti"] {
+        let out = run_script(
+            &target,
+            &[],
+            &[
+                "run",
+                &breakpoint,
+                "continue",
+                "watch *$rdi 4",
+                command,
+                "x/4 $rdi",
+                "delete 2",
+                "continue",
+                "quit",
+            ],
+        );
+        assert_count(&out, "ブレークポイントで停止:", 1);
+        assert_count(&out, "ウォッチポイント 2 がトリガーされました:", 1);
+        assert_contains(&out, "旧値 = 0x0");
+        assert_contains(&out, "新値 = 0x11");
+        assert_contains(&out, ": 11 00 00 00");
+        assert_contains(&out, "[プロセスは終了しました (code=0)]");
+        assert_not_contains(&out, "エラー:");
+    }
+}
+
+#[test]
+fn nexti_stops_at_an_existing_breakpoint_after_an_indirect_call() {
+    let target = execution_target();
+    let caller_entry = instruction_address(&target, "call_store");
+    let call = instruction_address(&target, "indirect_call");
+    let after_call = instruction_address(&target, "after_indirect_call");
+    let caller_breakpoint = format!("break *{caller_entry:#x}");
+    let at_return = format!("break *{after_call:#x}");
+    let out = run_script(
+        &target,
+        &[],
+        &[
+            "run",
+            &caller_breakpoint,
+            &at_return,
+            "continue",
+            "delete 1",
+            "stepi",
+            "stepi",
+            "nexti",
+            "info breakpoints",
+            "print/x $rip",
+            "continue",
+            "quit",
+        ],
+    );
+    assert_contains(&out, &format!("停止 (SIGTRAP): rip={call:#x}"));
+    assert_contains(&out, &format!("ブレークポイントで停止: {after_call:#x}"));
+    assert_contains(&out, &format!("2: {after_call:#x}"));
+    assert_contains(&out, &format!("$rip = {after_call:#x}"));
+    assert_contains(&out, "[プロセスは終了しました (code=0)]");
+    assert_not_contains(&out, "エラー:");
+}
+
+#[test]
+fn source_next_reports_a_breakpoint_reached_inside_an_indirect_call() {
+    let target = execution_target();
+    let call = instruction_address(&target, "indirect_call");
+    let store = instruction_address(&target, "store_value");
+    let at_call = format!("break *{call:#x}");
+    let at_store = format!("break *{store:#x}");
+    let out = run_script(
+        &target,
+        &[],
+        &[
+            "run",
+            &at_call,
+            &at_store,
+            "continue",
+            "next",
+            "print/x $rip",
+            "quit",
+        ],
+    );
+    assert_contains(&out, &format!("ブレークポイントで停止: {store:#x} <store_value>"));
+    assert_contains(&out, &format!("$rip = {store:#x}"));
+    assert_not_contains(&out, "エラー:");
+}
+
+#[test]
+fn continue_reports_a_signaled_fork_child_and_waits_for_the_parent() {
+    let out = run_script(
+        &execution_target(),
+        &["fork"],
+        &["lang en", "run", "continue", "continue", "quit"],
+    );
+    let (before_exit, _) = out
+        .split_once("Process exited (code=0)")
+        .unwrap_or_else(|| panic!("missing parent exit\n{out}"));
+    assert_contains(before_exit, "terminated by signal SIGKILL");
+    assert_contains(before_exit, "Stopped after receiving signal SIGCHLD");
+    assert_not_contains(&out, "Error:");
+}
+
+#[test]
+fn next_reports_exit_when_the_call_never_returns() {
+    let target = execution_target();
+    let call = instruction_address(&target, "exit_call");
+    let breakpoint = format!("break *{call:#x}");
+    let out = run_script(
+        &target,
+        &["exit"],
+        &[
+            "lang en",
+            "run",
+            &breakpoint,
+            "continue",
+            "next",
+            "print/d 7",
+            "quit",
+        ],
+    );
+    assert_contains(&out, &format!("Stopped at breakpoint: {call:#x}"));
+    assert_count(&out, "Process exited (code=7)", 1);
+    assert_contains(&out, "7 = 7");
+    assert_not_contains(&out, "Error:");
+}
+
+#[test]
+fn up_reports_missing_frame_pointer_and_missing_caller_address() {
+    let target = execution_target();
+    let store = instruction_address(&target, "store_value");
+    let breakpoint = format!("break *{store:#x}");
+    let out = run_script(
+        &target,
+        &[],
+        &[
+            "lang en",
+            "run",
+            &breakpoint,
+            "continue",
+            "set $rbp=0",
+            "up",
+            "set $rbp=$rdi",
+            "up",
+            "print/x $rip",
+            "quit",
+        ],
+    );
+    assert_contains(&out, "unable to obtain the frame pointer (rbp)");
+    assert_contains(&out, "Cannot obtain the caller's address");
+    assert_count(&out, "Error:", 2);
+    assert_contains(&out, &format!("$rip = {store:#x}"));
+}
+
+#[test]
+fn instruction_steps_at_a_call_breakpoint_stop_in_the_expected_frame() {
+    let target = execution_target();
+    let call = instruction_address(&target, "indirect_call");
+    let callee = instruction_address(&target, "store_value");
+    let return_address = instruction_address(&target, "after_indirect_call");
+    let at_call = format!("break *{call:#x}");
+
+    for (command, expected, value) in [
+        ("stepi", callee, "00"),
+        ("nexti", return_address, "11"),
+        ("next", return_address, "11"),
+    ] {
+        let out = run_script(
+            &target,
+            &[],
+            &["run", &at_call, "continue", command, "print/x $rip", "x/4 $rdi", "quit"],
+        );
+        assert_contains(&out, &format!("ブレークポイントで停止: {call:#x}"));
+        assert_contains(&out, &format!("$rip = {expected:#x}"));
+        assert_contains(&out, &format!(": {value} 00 00 00"));
+        assert_not_contains(&out, "エラー:");
+    }
+}
+
+#[test]
+fn source_steps_at_a_call_line_enter_or_skip_the_callee() {
+    let target = build_example("break_target", "break_target.c", &["-no-pie"]);
+    for (command, expected, other) in [
+        ("step", ">   4", ">  15"),
+        ("next", ">  15", ">   4"),
+    ] {
+        let out = run_script(
+            &target,
+            &[],
+            &["break break_target.c:14", "run", "continue", command, "quit"],
+        );
+        assert_contains(&out, ">  14");
+        assert_contains(&out, expected);
+        assert_not_contains(&out, other);
+        assert_not_contains(&out, "エラー:");
+    }
+}
+
+#[test]
+fn stepping_or_continuing_from_an_exit_instruction_reports_the_exit_once() {
+    let target = execution_target();
+    let address = instruction_address(&target, "exit_syscall");
+    let breakpoint = format!("break *{address:#x}");
+    for command in ["step", "next", "continue"] {
+        let out = run_script(
+            &target,
+            &["syscall"],
+            &[
+                "lang en",
+                "run",
+                &breakpoint,
+                "continue",
+                command,
+                "print/d 91",
+                "quit",
+            ],
+        );
+        assert_contains(&out, &format!("Stopped at breakpoint: {address:#x}"));
+        assert_count(&out, "Process exited (code=9)", 1);
+        assert_contains(&out, "91 = 91");
+        assert_not_contains(&out, "Error:");
+    }
+}
+
+#[test]
+fn step_reports_exit_when_entering_a_function_without_dwarf_that_never_returns() {
+    let line = include_str!("../examples/execution_target.c")
+        .lines()
+        .position(|line| line.contains("step into code without DWARF"))
+        .expect("missing call-site marker")
+        + 1;
+    let breakpoint = format!("break execution_target.c:{line}");
+    let out = run_script(
+        &execution_target(),
+        &["syscall"],
+        &[
+            "lang en",
+            &breakpoint,
+            "run",
+            "continue",
+            "step",
+            "print/d 92",
+            "quit",
+        ],
+    );
+    assert_contains(&out, &format!("execution_target.c:{line}"));
+    assert_count(&out, "Stopped at breakpoint:", 1);
+    assert_count(&out, "Process exited (code=9)", 1);
+    assert_contains(&out, "92 = 92");
+    assert_not_contains(&out, "Error:");
+}
+
+#[test]
+fn source_step_reports_a_fault_and_leaves_the_inferior_at_the_faulting_instruction() {
+    let target = execution_target();
+    let address = instruction_address(&target, "illegal_instruction");
+    let breakpoint = format!("break *{address:#x}");
+    for command in ["step", "next"] {
+        let out = run_script(
+            &target,
+            &["illegal"],
+            &[
+                "lang en",
+                "run",
+                &breakpoint,
+                "continue",
+                command,
+                "print/x $rip",
+                "quit",
+            ],
+        );
+        assert_contains(&out, "SIGILL");
+        assert_contains(&out, &format!("$rip = {address:#x}"));
+        assert_not_contains(&out, "Process exited");
+        assert_not_contains(&out, "Error:");
+    }
+}
+
+#[test]
+fn source_steps_report_the_next_dwarf_line_when_the_source_file_is_missing() {
+    let path_map = format!(
+        "-fdebug-prefix-map={}=/tdb-test-source-unavailable",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let target = build_example(
+        "break_target_missing_source",
+        "break_target.c",
+        &["-no-pie", &path_map],
+    );
+    for command in ["step", "next"] {
+        let out = run_script(
+            &target,
+            &[],
+            &[
+                "lang en",
+                "break break_target.c:14",
+                "run",
+                "continue",
+                command,
+                "quit",
+            ],
+        );
+        let line = if command == "step" { 4 } else { 15 };
+        assert!(
+            out.lines().any(|entry| {
+                entry == format!("/tdb-test-source-unavailable/examples/break_target.c:{line}")
+            }),
+            "{out}"
+        );
+        assert_not_contains(&out, "Error:");
+    }
+}
+
+#[test]
+fn nexti_steps_over_memory_indirect_calls_with_each_displacement_width() {
+    let target = execution_target();
+    let addresses = [
+        "call_sib",
+        "call_disp8",
+        "call_disp32",
+        "call_rip_relative",
+        "call_no_base",
+        "memory_calls_end",
+    ]
+    .map(|label| instruction_address(&target, label));
+    let breakpoint = format!("break *{:#x}", addresses[0]);
+    let mut commands = vec!["lang en", "run", &breakpoint, "continue"];
+    for _ in &addresses[1..] {
+        commands.extend(["nexti", "print/x $rip"]);
+    }
+    commands.extend(["continue", "quit"]);
+
+    let out = run_script(&target, &["memory"], &commands);
+    let actual: Vec<_> = out
+        .lines()
+        .filter_map(|line| line.strip_prefix("$rip = 0x"))
+        .map(|addr| u64::from_str_radix(addr, 16).unwrap())
+        .collect();
+    assert_eq!(actual, addresses[1..], "{out}");
+    assert_contains(&out, "Process exited (code=0)");
+    assert_not_contains(&out, "Error:");
+}
