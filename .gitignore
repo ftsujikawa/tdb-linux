@@ -6,4 +6,6 @@
 /examples/thread_target
 /examples/fork_target
 /examples/leak_target
+/examples/break_target
 /examples/.*.tmp.*
+/examples/.*.build.lock

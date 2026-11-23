@@ -37,27 +37,50 @@ pub fn tdb_bin() -> &'static str {
 /// `examples/<src_name>` を任意の gcc 引数でコンパイルし `examples/<bin_name>`
 /// を生成する。ソースより新しいバイナリが既にあれば再利用する。
 ///
-/// 複数のテストバイナリ (`tests/*.rs` はそれぞれ独立したプロセスとして
-/// ビルド・実行される) から並行に呼ばれても安全なように、一時ファイルへ
-/// 出力してから `rename` (同一ファイルシステム上ではアトミック) で
-/// 差し替える。2つのプロセスが同時に「未ビルド」と判定して2回コンパイル
-/// しても、どちらも同じソース・同じ引数から生成した妥当なバイナリなので
-/// 実害はない。
+/// 出力先ごとにロックを取り、並行するテスト間で更新確認とビルドを直列化する。
+/// GCC の出力は一時ファイルから `rename` して公開する。
 pub fn build_example_custom(bin_name: &str, src_name: &str, gcc_args: &[&str]) -> PathBuf {
     let dir = examples_dir();
     let src = dir.join(src_name);
+    build_if_stale(&dir, bin_name, &src, |tmp| {
+        Command::new("gcc")
+            .arg("-o")
+            .arg(tmp)
+            .arg(&src)
+            .args(gcc_args)
+            .status()
+    })
+}
+
+pub fn build_if_stale(
+    dir: &Path,
+    bin_name: &str,
+    src: &Path,
+    compile: impl FnOnce(&Path) -> std::io::Result<std::process::ExitStatus>,
+) -> PathBuf {
     let out = dir.join(bin_name);
-    let up_to_date = match (fs::metadata(&src), fs::metadata(&out)) {
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(format!(".{bin_name}.build.lock")))
+        .unwrap_or_else(|e| panic!("failed to open build lock for {bin_name}: {e}"));
+    lock.lock()
+        .unwrap_or_else(|e| panic!("failed to acquire build lock for {bin_name}: {e}"));
+    let up_to_date = match (fs::metadata(src), fs::metadata(&out)) {
         (Ok(s), Ok(o)) => o.modified().unwrap() >= s.modified().unwrap(),
         _ => false,
     };
     if !up_to_date {
-        let tmp = dir.join(format!(".{}.tmp.{}", bin_name, std::process::id()));
-        let mut cmd = Command::new("gcc");
-        cmd.arg("-o").arg(&tmp).arg(&src);
-        cmd.args(gcc_args);
-        let status = cmd.status().unwrap_or_else(|e| panic!("failed to invoke gcc: {e}"));
-        assert!(status.success(), "gcc failed to build {bin_name} from {src_name}");
+        static BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let build_id = BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".{bin_name}.tmp.{}.{build_id}", std::process::id()));
+        let status = compile(&tmp).unwrap_or_else(|e| panic!("failed to invoke gcc: {e}"));
+        assert!(
+            status.success(),
+            "gcc failed to build {bin_name} from {}",
+            src.display()
+        );
         fs::rename(&tmp, &out).unwrap_or_else(|e| panic!("failed to install {bin_name}: {e}"));
     }
     out
