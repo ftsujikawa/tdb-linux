@@ -288,6 +288,15 @@ dbg.bp_install_failed:
 dbg.process_started:
   ja: "プロセスを起動しました (pid=%{pid}, entry=%{entry}%{pie})"
   en: "Process started (pid=%{pid}, entry=%{entry}%{pie})"
+dbg.auxv_read_failed:
+  ja: "%{path} の読み取りに失敗しました"
+  en: "Failed to read %{path}"
+dbg.auxv_entry_missing:
+  ja: "%{path} に AT_ENTRY が見つかりません"
+  en: "AT_ENTRY not found in %{path}"
+dbg.invalid_pie_entry:
+  ja: "PIE の実行時エントリアドレスが ELF のエントリアドレスを下回っています"
+  en: "PIE runtime entry address is below the ELF entry address"
 dbg.bp_set:
   ja: "ブレークポイント %{id} を %{label} (%{addr}) に設定しました"
   en: "Breakpoint %{id} set at %{label} (%{addr})"
