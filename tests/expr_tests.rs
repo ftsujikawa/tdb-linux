@@ -325,3 +325,138 @@ fn examine_memory_dumps_hex_bytes() {
     session.send(&["quit"]);
     session.finish();
 }
+
+fn coverage_target_stop() -> String {
+    coverage_target_breakpoint("inspect initialized locals here")
+}
+
+#[test]
+fn string_print_stops_at_nul_or_the_configured_byte_limit() {
+    let out = run_script(
+        &coverage_target(),
+        &[],
+        &[
+            &coverage_target_stop(),
+            "run",
+            "continue",
+            "print/s text",
+            "set print elements 9",
+            "print /s text",
+            "set print elements 0",
+            "print/s text",
+            "set print elements unlimited",
+            "show print",
+            "p/s text",
+            "quit",
+        ],
+    );
+    assert_count(&out, "text = \"coverage-test\"", 2);
+    assert_contains(&out, "text = \"coverage-...\"");
+    assert_contains(&out, "text = \"...\"");
+    assert_contains(&out, "print elements: unlimited");
+    assert_not_contains(&out, "エラー:");
+}
+
+#[test]
+fn floating_point_locals_can_be_read_and_written_at_both_widths() {
+    let out = run_script(
+        &coverage_target(),
+        &[],
+        &[
+            &coverage_target_stop(),
+            "run",
+            "continue",
+            "print fraction",
+            "print single",
+            "set fraction = 2.5",
+            "set single = -1.25",
+            "set print pretty on",
+            "print fraction",
+            "print single",
+            "print &fraction",
+            "quit",
+        ],
+    );
+    for expected in [
+        "fraction = 1.25",
+        "single = -2.5",
+        "fraction = (double)2.5",
+        "single = (float)-1.25",
+        "&fraction = (double *)0x",
+    ] {
+        assert_contains(&out, expected);
+    }
+    assert_not_contains(&out, "エラー:");
+}
+
+#[test]
+fn multidimensional_array_read_and_write_preserve_other_elements() {
+    let out = run_script(
+        &coverage_target(),
+        &[],
+        &[
+            &coverage_target_stop(),
+            "run",
+            "continue",
+            "print matrix[1][0]",
+            "set matrix[1][0] = 7",
+            "print matrix[1][0]",
+            "print matrix[1][1]",
+            "quit",
+        ],
+    );
+    assert_contains(&out, "matrix[1][0] = 3");
+    assert_contains(&out, "matrix[1][0] = 7");
+    assert_contains(&out, "matrix[1][1] = 4");
+    assert_not_contains(&out, "エラー:");
+}
+
+#[test]
+fn byte_write_and_literal_address_dump_preserve_the_adjacent_byte() {
+    let target = coverage_target();
+    let mut session = Session::spawn(&target, &[]);
+    session.send(&[
+        &coverage_target_stop(),
+        "run",
+        "continue",
+        "set *(&message) = 65",
+        "print/x &message",
+    ]);
+    let out = session.sync();
+    let address = out
+        .lines()
+        .find_map(|line| line.strip_prefix("&message = "))
+        .unwrap_or_else(|| panic!("missing message address\n{out}"));
+    let command = format!("x /2 {address}");
+    session.send(&[&command, "print/s text", "quit"]);
+    let out = session.finish();
+    assert_contains(&out, ": 41 6f");
+    assert_contains(&out, "text = \"Aoverage-test\"");
+    assert_not_contains(&out, "エラー:");
+}
+
+#[test]
+fn print_formats_reject_unsupported_values_and_keep_the_session_usable() {
+    let out = run_script(
+        &coverage_target(),
+        &[],
+        &[
+            "lang en",
+            &coverage_target_stop(),
+            "run",
+            "continue",
+            "print/d 15",
+            "p/i -15",
+            "print/o 0",
+            "print/c 1",
+            "print/x matrix",
+            "print/z 1",
+            "print/d 42",
+            "quit",
+        ],
+    );
+    for expected in ["15 = 15", "-15 = -15", "0 = 0", "1 = 1 '\\x01'", "42 = 42"] {
+        assert_contains(&out, expected);
+    }
+    assert_count(&out, "Error:", 2);
+}

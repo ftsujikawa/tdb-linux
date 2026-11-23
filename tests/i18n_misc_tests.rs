@@ -93,3 +93,78 @@ fn unknown_command_reports_error_and_continues_repl() {
     assert_contains(&out, "不明なコマンド: 'frobnicate'");
     assert_contains(&out, "run, r");
 }
+
+#[test]
+fn incomplete_commands_report_usage_and_allow_the_next_command() {
+    let out = run_script(
+        &target_hello(),
+        &[],
+        &[
+            "lang en",
+            "info nope",
+            "thread",
+            "thread apply all",
+            "lock",
+            "delete",
+            "leak nope",
+            "show nope",
+            "set",
+            "set print nope",
+            "x",
+            "print",
+            "print/d 123",
+            "quit",
+        ],
+    );
+    for expected in [
+        "Usage: info ",
+        "Usage: thread <",
+        "Usage: thread apply all ",
+        "Usage: lock ",
+        "Usage: delete ",
+        "Unknown argument: 'nope'",
+        "Usage: show ",
+        "Usage: set $",
+        "Usage: set print ",
+        "Usage: x/",
+        "Usage: print[",
+        "123 = 123",
+    ] {
+        assert_contains(&out, expected);
+    }
+}
+
+#[test]
+fn thread_apply_all_propagates_quit_without_running_queued_commands() {
+    let out = run_script(
+        &target_hello(),
+        &[],
+        &["run", "thread apply all quit", "print/d 987654"],
+    );
+    assert_not_contains(&out, "987654 =");
+    assert_not_contains(&out, "エラー:");
+}
+
+#[test]
+fn empty_input_and_eof_leave_the_repl_cleanly() {
+    let out = run_script(&target_hello(), &[], &["", "  ", "print/d 7"]);
+    assert_contains(&out, "7 = 7");
+    assert_not_contains(&out, "エラー:");
+}
+
+#[test]
+fn startup_rejects_a_missing_argument_and_a_missing_program() {
+    let nonexistent = examples_dir().join("missing-tdb-test-executable");
+    for (args, expected) in [
+        (vec![], "Usage: tdb <program> [args...]"),
+        (vec![nonexistent.as_os_str()], "Program not found:"),
+    ] {
+        let output = std::process::Command::new(tdb_bin())
+            .args(args)
+            .env("LC_ALL", "en_US.UTF-8")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_contains(&String::from_utf8_lossy(&output.stderr), expected);
+    }
+}

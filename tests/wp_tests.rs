@@ -80,3 +80,27 @@ fn watch_triggers_across_multiple_threads() {
     assert_contains(&out, "旧値");
     assert_contains(&out, "新値");
 }
+
+#[test]
+fn address_watchpoints_default_to_eight_bytes_and_validate_explicit_lengths() {
+    let out = run_script(
+        &target_hello(),
+        &[],
+        &[
+            "lang en",
+            "run",
+            "watch *$rsp nope",
+            "watch *$rsp 3",
+            "watch *$rsp",
+            "info watchpoints",
+            "delete 1",
+            "info watchpoints",
+            "quit",
+        ],
+    );
+    assert_count(&out, "Error:", 2);
+    assert_contains(&out, "Watchpoint 1 set at");
+    assert_contains(&out, "8 bytes)  current value =");
+    assert_contains(&out, "Watchpoint 1 deleted");
+    assert_contains(&out, "No watchpoints are set");
+}

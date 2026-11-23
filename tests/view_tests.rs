@@ -117,3 +117,105 @@ fn info_registers_shows_all_register_groups() {
         assert_contains(&out, field);
     }
 }
+
+#[test]
+fn integer_register_names_round_trip_and_pc_alias_reads_rip() {
+    let target = target_hello();
+    let registers = [
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12",
+        "r13", "r14", "r15", "orig_rax",
+    ];
+    let mut commands = vec!["run".to_string()];
+    for (index, name) in registers.iter().enumerate() {
+        commands.push(format!("set ${name}={}", 100 + index));
+    }
+    for name in registers {
+        commands.push(format!("print/d ${name}"));
+    }
+    for name in [
+        "rip", "eflags", "cs", "ss", "ds", "es", "fs", "gs", "fs_base", "gs_base",
+    ] {
+        commands.push(format!("set ${name}=${name}"));
+    }
+    commands.extend(["print/d $pc-$rip", "quit"].map(String::from));
+    let commands: Vec<_> = commands.iter().map(String::as_str).collect();
+    let out = run_script(&target, &[], &commands);
+    for (index, name) in registers.iter().enumerate() {
+        assert_contains(&out, &format!("${name} = {}", 100 + index));
+    }
+    assert_contains(&out, "$pc-$rip = 0");
+    assert_not_contains(&out, "エラー:");
+}
+
+#[test]
+fn x87_and_xmm_registers_round_trip_and_reject_out_of_range_names() {
+    let out = run_script(
+        &target_hello(),
+        &[],
+        &[
+            "run",
+            "set $st0=0",
+            "set $st7=-2.5",
+            "set $xmm15=4660",
+            "print/x $st0",
+            "print/x $st7",
+            "print/x $xmm15",
+            "info registers",
+            "print $st8",
+            "set $xmm16=1",
+            "quit",
+        ],
+    );
+    for expected in [
+        "$st0 = 0x0",
+        "$st7 = 0xa000000000000000",
+        "$xmm15 = 0x1234",
+        "value=-2.5",
+        "st8",
+        "xmm16",
+    ] {
+        assert_contains(&out, expected);
+    }
+    assert_count(&out, "エラー:", 2);
+}
+
+#[test]
+fn source_and_symbol_queries_distinguish_missing_data_and_bad_input() {
+    let out = run_script(
+        &target_hello_nodbg(),
+        &[],
+        &[
+            "lang en",
+            "syms this_symbol_does_not_exist",
+            "lines",
+            "list main",
+            "list hello.c:bad",
+            "list *0x0",
+            "list this_function_does_not_exist",
+            "quit",
+        ],
+    );
+    assert_contains(&out, "No symbols found");
+    assert_contains(&out, "No line info found");
+    assert_contains(&out, "Failed to parse line number: 'bad'");
+    assert_contains(&out, "this_function_does_not_exist");
+    assert_count(&out, "Error:", 4);
+}
+
+#[test]
+fn out_of_range_source_and_unmapped_memory_report_different_failures() {
+    let out = run_script(
+        &target_hello(),
+        &[],
+        &[
+            "lang en",
+            "list hello.c:9999",
+            "run",
+            "x/1 0x0",
+            "set *0 = 65",
+            "quit",
+        ],
+    );
+    assert_contains(&out, "No source in the specified line range");
+    assert_count(&out, "Memory read failed", 2);
+}

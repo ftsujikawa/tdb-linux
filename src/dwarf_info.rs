@@ -604,3 +604,37 @@ fn resolve_file_path<'a>(
     path.push(name);
     path
 }
+
+#[cfg(test)]
+mod tests {
+    use super::read_sleb128;
+
+    #[test]
+    fn sleb128_decodes_single_and_multibyte_signed_values() {
+        let values: &[(&[u8], i64)] = &[
+            (&[0x00], 0),
+            (&[0x3f], 63),
+            (&[0x40], -64),
+            (&[0xc0, 0x00], 64),
+            (&[0xbf, 0x7f], -65),
+            (
+                &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00],
+                i64::MAX,
+            ),
+            (
+                &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f],
+                i64::MIN,
+            ),
+        ];
+        for (bytes, expected) in values {
+            assert_eq!(read_sleb128(bytes), Some(*expected), "{bytes:x?}");
+        }
+    }
+
+    #[test]
+    fn sleb128_rejects_unterminated_and_overlong_input() {
+        for bytes in [&[][..], &[0x80][..], &[0x80; 10][..]] {
+            assert_eq!(read_sleb128(bytes), None, "{bytes:x?}");
+        }
+    }
+}

@@ -34,14 +34,15 @@ pub fn tdb_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tdb")
 }
 
-/// `examples/<src_name>` を任意の gcc 引数でコンパイルし `examples/<bin_name>`
-/// を生成する。ソースより新しいバイナリが既にあれば再利用する。
+/// `examples/<src_name>` を任意の gcc 引数でコンパイルしてテスト用の
+/// バイナリを生成する。ソースより新しいバイナリが既にあれば再利用する。
 ///
 /// 出力先ごとにロックを取り、並行するテスト間で更新確認とビルドを直列化する。
 /// GCC の出力は一時ファイルから `rename` して公開する。
 pub fn build_example_custom(bin_name: &str, src_name: &str, gcc_args: &[&str]) -> PathBuf {
-    let dir = examples_dir();
-    let src = dir.join(src_name);
+    let src = examples_dir().join(src_name);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-fixtures");
+    fs::create_dir_all(&dir).expect("failed to create test fixture directory");
     build_if_stale(&dir, bin_name, &src, |tmp| {
         Command::new("gcc")
             .arg("-o")
@@ -91,6 +92,19 @@ pub fn build_example(bin_name: &str, src_name: &str, extra_gcc_args: &[&str]) ->
     let mut args = vec!["-g", "-O0"];
     args.extend_from_slice(extra_gcc_args);
     build_example_custom(bin_name, src_name, &args)
+}
+
+pub fn coverage_target() -> PathBuf {
+    build_example("coverage_target", "coverage_target.c", &["-no-pie"])
+}
+
+pub fn coverage_target_breakpoint(marker: &str) -> String {
+    let line = include_str!("../../examples/coverage_target.c")
+        .lines()
+        .position(|line| line.contains(marker))
+        .unwrap_or_else(|| panic!("missing breakpoint marker {marker:?}"))
+        + 1;
+    format!("break coverage_target.c:{line}")
 }
 
 pub fn target_hello() -> PathBuf {

@@ -60,3 +60,58 @@ fn leak_off_disables_tracking() {
 
     assert_contains(&out, "メモリリーク追跡: off");
 }
+
+#[test]
+fn realloc_failure_preserves_the_record_and_success_replaces_it() {
+    let out = run_script(
+        &coverage_target(),
+        &["realloc"],
+        &[
+            "lang en",
+            "leak on",
+            &coverage_target_breakpoint("inspect allocation after failed realloc"),
+            "run",
+            "continue",
+            "leaks",
+            "continue",
+            "leaks",
+            "quit",
+        ],
+    );
+    let (before_exit, after_exit) = out
+        .split_once("Process exited (code=0)")
+        .unwrap_or_else(|| panic!("missing successful exit\n{out}"));
+    assert_contains(before_exit, "37 bytes");
+    assert_contains(after_exit, "73 bytes");
+    assert_contains(after_exit, "realloc (");
+    assert_not_contains(after_exit, "37 bytes");
+    assert_not_contains(after_exit, "149 bytes");
+    assert_not_contains(&out, "Error:");
+}
+
+#[test]
+fn switching_leak_tracking_off_after_hooks_are_installed_preserves_user_breakpoints() {
+    let out = run_script(
+        &coverage_target(),
+        &["realloc"],
+        &[
+            "lang en",
+            "leak on",
+            "break main",
+            "break exercise_realloc",
+            "run",
+            "continue",
+            "leak off",
+            "continue",
+            "continue",
+            "leaks",
+            "quit",
+        ],
+    );
+    assert_count(&out, "Stopped at breakpoint:", 2);
+    assert_contains(&out, "<main>");
+    assert_contains(&out, "<exercise_realloc>");
+    assert_contains(&out, "Process exited (code=0)");
+    assert_contains(&out, "Memory leak tracking is disabled");
+    assert_not_contains(&out, "Error:");
+}
