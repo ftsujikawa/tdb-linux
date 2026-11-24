@@ -1,0 +1,19 @@
+name: Tests
+
+on: push
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.100.0 --profile minimal
+      - name: Run tests
+        run: env -u LC_ALL cargo +1.100.0 test --locked -- --test-threads=1
