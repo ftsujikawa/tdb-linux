@@ -545,3 +545,17 @@ fn nexti_steps_over_memory_indirect_calls_with_each_displacement_width() {
     assert_contains(&out, "Process exited (code=0)");
     assert_not_contains(&out, "Error:");
 }
+
+#[test]
+fn source_step_reports_signal_termination_inside_an_undebugged_function() {
+    let stop = coverage_target_breakpoint("step into libc without DWARF");
+    let out = run_script(
+        &coverage_target(),
+        &["kill"],
+        &["lang en", &stop, "run", "continue", "step", "quit"],
+    );
+
+    assert_count(&out, "Stopped at breakpoint:", 1);
+    assert_count(&out, "Process terminated by signal SIGKILL", 1);
+    assert_not_contains(&out, "Error:");
+}

@@ -168,3 +168,15 @@ fn startup_rejects_a_missing_argument_and_a_missing_program() {
         assert_contains(&String::from_utf8_lossy(&output.stderr), expected);
     }
 }
+
+#[test]
+fn explicit_lc_all_takes_precedence_over_lang() {
+    let target = target_hello();
+    let env = [("LANG", "ja_JP.UTF-8"), ("LC_ALL", "EN_US.UTF-8")];
+    let mut session = Session::spawn_with_env(&target, &[], &env);
+    session.send(&["quit"]);
+
+    let out = session.finish();
+    assert_contains(&out, "Type 'help' to see the list of commands.");
+    assert_not_contains(&out, "コマンド一覧");
+}

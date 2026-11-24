@@ -195,3 +195,41 @@ fn fork_child_process_is_tracked_and_reported_on_exit() {
     assert_contains(&out, "[プロセス]");
     assert_contains(&out, "が終了しました (code=0)]");
 }
+
+#[test]
+fn unknown_thread_commands_preserve_focus_and_allow_locking_by_tid() {
+    let mut session = Session::spawn(&coverage_target(), &[]);
+    session.send(&["lang en", "run", "info threads"]);
+    let stopped = session.sync();
+    let focus = stopped
+        .lines()
+        .find(|line| line.trim_start().starts_with('*'))
+        .expect("missing focused thread");
+    let id = focused_thread_id(&stopped);
+    let tid = focus
+        .split_once(':')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("missing OS thread ID in {focus}"));
+    let lock_by_tid = format!("lock {tid}");
+
+    session.send(&[
+        "run",
+        "thread 0",
+        "lock 0",
+        "unlock",
+        &lock_by_tid,
+        "info threads",
+        "unlock",
+        "continue",
+        "quit",
+    ]);
+    let out = session.finish();
+    assert_contains(&out, "The process is already running");
+    assert_count(&out, "Thread 0 does not exist", 2);
+    assert_contains(&out, "No thread is currently locked");
+    assert_contains(&out, &format!("Locked to thread {id} (tid {tid})"));
+    assert_contains(&out, "[locked]");
+    assert_contains(&out, "Thread lock released");
+    assert_contains(&out, "Process exited (code=0)");
+    assert_count(&out, "Error:", 3);
+}

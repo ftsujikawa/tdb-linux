@@ -545,3 +545,69 @@ fn invalid_member_index_and_aggregate_assignment_leave_locals_unchanged() {
     assert_contains(&out, "ts = {a = 0, b = 0, c = 0}");
     assert_count(&out, "Error:", 4);
 }
+
+#[test]
+fn arithmetic_operators_evaluate_integer_and_mixed_float_operands() {
+    let out = run_script(
+        &target_hello(),
+        &[],
+        &[
+            "print/d +7 / 2",
+            "print/d 7 % 3",
+            "print/d ~0",
+            "print/d 6 & 3",
+            "print/d 6 ^ 3",
+            "print/d -8 >> 2",
+            "print 1.5 + 2",
+            "print 3 - 1.5",
+            "print 1.5 * 3",
+            "print 5 / 2.0",
+            "print 5.5 % 2",
+            "print/d 3.75",
+            "quit",
+        ],
+    );
+
+    for expected in [
+        "+7 / 2 = 3",
+        "7 % 3 = 1",
+        "~0 = -1",
+        "6 & 3 = 2",
+        "6 ^ 3 = 5",
+        "-8 >> 2 = -2",
+        "1.5 + 2 = 3.5",
+        "3 - 1.5 = 1.5",
+        "1.5 * 3 = 4.5",
+        "5 / 2.0 = 2.5",
+        "5.5 % 2 = 1.5",
+        "3.75 = 3\n",
+    ] {
+        assert_contains(&out, expected);
+    }
+    assert_not_contains(&out, "エラー:");
+}
+
+#[test]
+fn invalid_arithmetic_reports_errors_and_allows_the_next_expression() {
+    let out = run_script(
+        &target_hello(),
+        &[],
+        &[
+            "lang en",
+            "print 7 / 0",
+            "print 7 % 0",
+            "print 1 & 2.5",
+            "print/d 2 + 3",
+            "quit",
+        ],
+    );
+
+    assert_contains(&out, "Division by zero");
+    assert_contains(&out, "Modulo by zero");
+    assert_contains(
+        &out,
+        "Operator '&' cannot be used with floating-point numbers",
+    );
+    assert_count(&out, "Error:", 3);
+    assert_contains(&out, "2 + 3 = 5");
+}

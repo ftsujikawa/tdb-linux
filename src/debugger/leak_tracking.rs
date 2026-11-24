@@ -437,3 +437,23 @@ fn load_dynamic_symbols(path: &Path) -> Result<HashMap<String, u64>> {
     }
     Ok(map)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::load_dynamic_symbols;
+    use std::path::Path;
+
+    #[test]
+    fn dynamic_symbol_loading_distinguishes_read_and_elf_parse_errors() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let directory = root.join("src");
+        let read_error = load_dynamic_symbols(&directory).unwrap_err();
+        assert_eq!(
+            read_error.to_string(),
+            format!("failed to read {}", directory.display())
+        );
+
+        let parse_error = load_dynamic_symbols(&root.join("Cargo.toml")).unwrap_err();
+        assert_eq!(parse_error.to_string(), "failed to parse library ELF");
+    }
+}

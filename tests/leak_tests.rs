@@ -70,7 +70,10 @@ fn realloc_failure_preserves_the_record_and_success_replaces_it() {
             "lang en",
             "leak on",
             &coverage_target_breakpoint("inspect allocation after failed realloc"),
+            &coverage_target_breakpoint("inspect fresh realloc allocation"),
             "run",
+            "continue",
+            "leaks",
             "continue",
             "leaks",
             "continue",
@@ -82,10 +85,12 @@ fn realloc_failure_preserves_the_record_and_success_replaces_it() {
         .split_once("Process exited (code=0)")
         .unwrap_or_else(|| panic!("missing successful exit\n{out}"));
     assert_contains(before_exit, "37 bytes");
+    assert_contains(before_exit, "43 bytes");
     assert_contains(after_exit, "73 bytes");
     assert_contains(after_exit, "realloc (");
     assert_not_contains(after_exit, "37 bytes");
     assert_not_contains(after_exit, "149 bytes");
+    assert_not_contains(after_exit, "43 bytes");
     assert_not_contains(&out, "Error:");
 }
 
@@ -113,5 +118,25 @@ fn switching_leak_tracking_off_after_hooks_are_installed_preserves_user_breakpoi
     assert_contains(&out, "<exercise_realloc>");
     assert_contains(&out, "Process exited (code=0)");
     assert_contains(&out, "Memory leak tracking is disabled");
+    assert_not_contains(&out, "Error:");
+}
+
+#[test]
+fn free_after_enabling_tracking_reports_an_untracked_pointer_without_a_leak() {
+    let stop = coverage_target_breakpoint("enable tracking after allocation");
+    let out = run_script(
+        &coverage_target(),
+        &["free"],
+        &[
+            "lang en", "run", &stop, "continue", "leak on", "continue", "leaks", "quit",
+        ],
+    );
+
+    assert_contains(&out, "Process exited (code=0)");
+    assert_contains(&out, "No unfreed heap allocations (allocs: 0, frees: 0)");
+    assert_contains(
+        &out,
+        "frees of untracked pointers (possible double-free): 1",
+    );
     assert_not_contains(&out, "Error:");
 }

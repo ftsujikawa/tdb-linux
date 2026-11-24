@@ -34,7 +34,22 @@ static int exercise_realloc(void)
         return 4;
     }
     /* glibc releases a non-null allocation for realloc(ptr, 0). */
-    return realloc(released, 0) != NULL;
+    if (realloc(released, 0) != NULL) {
+        return 5;
+    }
+
+    void *empty = malloc(oversize);
+    if (empty) {
+        free(empty);
+        return 6;
+    }
+    free(empty);
+    void *fresh = realloc(empty, 43);
+    if (!fresh) {
+        return 7;
+    }
+    free(fresh); /* inspect fresh realloc allocation */
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -48,8 +63,16 @@ int main(int argc, char **argv)
     if (argc > 1 && argv[1][0] == 'r') { /* inspect initialized locals here */
         return exercise_realloc();
     }
+    if (argc > 1 && argv[1][0] == 'f') {
+        void *buffer = malloc(37);
+        if (!buffer) {
+            return 1;
+        }
+        free(buffer); /* enable tracking after allocation */
+        return 0;
+    }
     if (argc > 1 && argv[1][0] == 'k') {
-        raise(SIGKILL);
+        raise(SIGKILL); /* step into libc without DWARF */
     }
     return text[0] == 'c' && fraction > single && matrix[1][1] == 4 ? 0 : 1;
 }

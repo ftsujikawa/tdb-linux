@@ -161,16 +161,12 @@ impl Session {
         Self::spawn_with_env(target, args, &[])
     }
 
-    /// `envs` に `LANG`/`LC_ALL` を含めない限り、`LANG=ja_JP.UTF-8` を
-    /// 既定にする(テスト実行環境のロケールに依存せず、日本語表示を
-    /// 前提にしたアサーションを安定させるため)。
+    /// 親の `LC_ALL` を引き継がず、明示指定がなければ日本語で起動する。
     pub fn spawn_with_env(target: &Path, args: &[&str], envs: &[(&str, &str)]) -> Self {
         let mut cmd = Command::new(tdb_bin());
         cmd.arg(target);
         cmd.args(args);
-        if !envs.iter().any(|(k, _)| *k == "LANG" || *k == "LC_ALL") {
-            cmd.env("LANG", "ja_JP.UTF-8");
-        }
+        cmd.env_remove("LC_ALL").env("LANG", "ja_JP.UTF-8");
         for (k, v) in envs {
             cmd.env(k, v);
         }
