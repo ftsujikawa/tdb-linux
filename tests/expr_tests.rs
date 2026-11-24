@@ -460,3 +460,88 @@ fn print_formats_reject_unsupported_values_and_keep_the_session_usable() {
     }
     assert_count(&out, "Error:", 2);
 }
+
+#[test]
+fn variable_lists_show_global_struct_members_and_typed_locals() {
+    let out = run_script(
+        &coverage_target(),
+        &[],
+        &[
+            &coverage_target_stop(),
+            "run",
+            "continue",
+            "show globals",
+            "show locals",
+            "set print pretty on",
+            "show globals",
+            "show locals",
+            "print matrix",
+            "quit",
+        ],
+    );
+    for expected in [
+        "global_value = 17",
+        "global_sample = {reading = 1.5, value = 0x",
+        "fraction = 1.25",
+        "global_value = (int)17",
+        "reading = (double)1.5",
+        "value = (int *)0x",
+        "fraction = (double)1.25",
+        "text = (char *)0x",
+        "matrix = (int[",
+    ] {
+        assert_contains(&out, expected);
+    }
+    assert_not_contains(&out, "エラー:");
+}
+
+#[test]
+fn compound_expressions_read_variables_and_pointer_indexing_after_assignment() {
+    let target = target_struct();
+    let out = run_script(
+        &target,
+        &[],
+        &[
+            "break target.c:30",
+            "run",
+            "continue",
+            "set sa_ptr[1].a = 42",
+            "print/d sa[1].a + x",
+            "set sa_ptr = &ts",
+            "set ts.a = 7",
+            "print/d sa_ptr[0].a + y",
+            "quit",
+        ],
+    );
+    assert_contains(&out, "sa[1].a + x = 52");
+    assert_contains(&out, "sa_ptr[0].a + y = 27");
+    assert_not_contains(&out, "エラー:");
+}
+
+#[test]
+fn invalid_member_index_and_aggregate_assignment_leave_locals_unchanged() {
+    let out = run_script(
+        &target_struct(),
+        &[],
+        &[
+            "lang en",
+            "break target.c:30",
+            "run",
+            "continue",
+            "print x.bad",
+            "print ts.missing",
+            "print x[0]",
+            "set ts=1",
+            "print x",
+            "print ts",
+            "quit",
+        ],
+    );
+    assert_contains(&out, "neither a struct nor a pointer");
+    assert_contains(&out, "Member 'missing' not found");
+    assert_contains(&out, "neither an array nor a pointer");
+    assert_contains(&out, "Writing to this type is not supported");
+    assert_contains(&out, "x = 10");
+    assert_contains(&out, "ts = {a = 0, b = 0, c = 0}");
+    assert_count(&out, "Error:", 4);
+}

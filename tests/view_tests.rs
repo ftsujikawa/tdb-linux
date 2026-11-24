@@ -219,3 +219,48 @@ fn out_of_range_source_and_unmapped_memory_report_different_failures() {
     assert_contains(&out, "No source in the specified line range");
     assert_count(&out, "Memory read failed", 2);
 }
+
+#[test]
+fn source_queries_resolve_default_lines_and_pie_runtime_addresses() {
+    let target = target_hello();
+    let mut session = Session::spawn(&target, &[]);
+    session.send(&[
+        "list",
+        "list 4",
+        "break add",
+        "run",
+        "continue",
+        "print/x $rip",
+    ]);
+    let out = session.sync();
+    let address = out
+        .lines()
+        .find_map(|line| line.strip_prefix("$rip = "))
+        .unwrap_or_else(|| panic!("missing runtime address\n{out}"));
+    let list_address = format!("list *{address}");
+    session.send(&[
+        "list",
+        &list_address,
+        "lines add",
+        "lang en",
+        "list missing.c:4",
+        "quit",
+    ]);
+    let out = session.finish();
+    let source_header = format!("{}:", examples_dir().join("hello.c").display());
+    assert_count(&out, &format!("{source_header}\n"), 4);
+    assert_contains(&out, &format!("{source_header}4"));
+    assert_contains(&out, "No line info found for file 'missing.c'");
+    assert_count(&out, "Error:", 1);
+}
+
+#[test]
+fn scope_listing_reports_missing_function_info_at_an_undebugged_pc() {
+    let out = run_script(
+        &target_hello_nodbg(),
+        &[],
+        &["lang en", "run", "show locals", "show args", "quit"],
+    );
+    assert_count(&out, "No function info found for the current PC", 2);
+    assert_not_contains(&out, "Error:");
+}

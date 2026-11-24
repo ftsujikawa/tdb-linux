@@ -2,6 +2,14 @@
 #include <signal.h>
 #include <stdlib.h>
 
+struct sample {
+    double reading;
+    int *value;
+};
+
+int global_value = 17;
+struct sample global_sample = {1.5, &global_value};
+
 static int exercise_realloc(void)
 {
     void *buffer = malloc(37);
