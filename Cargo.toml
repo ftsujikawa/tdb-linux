@@ -21,3 +21,7 @@ lrpar = "0.15"
 cfgrammar = "0.15"
 lrlex = "0.15"
 lrpar = "0.15"
+
+# cargo install で別途インストールが必要な開発ツール
+[package.metadata.dev-tools]
+cargo-llvm-cov = "0.9.2"  # カバレッジ計測: cargo llvm-cov --all-targets
